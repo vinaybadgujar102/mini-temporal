@@ -1,6 +1,8 @@
 import { pool } from "../db/client";
 import { producer } from "../kafka/client";
 
+const TOPIC = "workflow-tasks";
+
 export async function publishOutbox() {
   const client = await pool.connect();
 
@@ -15,7 +17,7 @@ export async function publishOutbox() {
 
     for (const row of result.rows) {
       await producer.send({
-        topic: "workflow-tasks",
+        topic: TOPIC,
         messages: [
           {
             key: row.task_id,

@@ -58,10 +58,6 @@ CREATE TABLE IF NOT EXISTS workflows (
 );
 
 
--- ============================================================
--- TASKS
--- ============================================================
-
 CREATE TABLE IF NOT EXISTS tasks (
   id UUID PRIMARY KEY,
   workflow_id UUID NOT NULL
@@ -83,11 +79,6 @@ CREATE TABLE IF NOT EXISTS tasks (
 
   UNIQUE (workflow_id, operation_id)
 );
-
-
--- ============================================================
--- TASK ATTEMPTS
--- ============================================================
 
 CREATE TABLE IF NOT EXISTS task_attempts (
   id UUID PRIMARY KEY,
