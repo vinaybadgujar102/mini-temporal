@@ -61,9 +61,7 @@ That closes the gap where a task is scheduled in the database but never reaches 
 
 ## Demo
 
-<!-- TODO: paste your video URL below (YouTube, GitHub upload, etc.) -->
-
-**Demo video:** _[Add link — full stack run: workflow start, outbox relay, Kafka, worker, dependency unblocking]_
+https://github.com/user-attachments/assets/9916d088-c80b-47bd-a9b0-a7363fc68a8c
 
 Local browser demo (no Postgres/Kafka):
 
