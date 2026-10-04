@@ -1,12 +1,12 @@
 # mini-temporal
 
-A durable workflow orchestration engine inspired by [Temporal](https://temporal.io), built with Bun, PostgreSQL, and Apache Kafka.
+Workflow orchestration in the style of [Temporal](https://temporal.io), built with Bun, PostgreSQL, and Apache Kafka.
 
-The project explores how to run multi-step workflows with task dependencies, durable state, append-only history, and asynchronous worker execution — without relying on a hosted orchestration platform.
+You define tasks and dependencies. PostgreSQL stores workflow state, task state, and an append-only event log. Kafka carries ready tasks to workers. A transactional outbox writes scheduling intent to Postgres before anything hits the bus, so a crash after commit does not lose work.
 
-PostgreSQL holds workflow and task state plus publication intent. Kafka delivers ready tasks to workers. A transactional outbox bridges the two so scheduling survives process crashes.
+No hosted orchestration platform required.
 
-## Tech Stack
+## Tech stack
 
 - TypeScript
 - Bun
@@ -15,7 +15,7 @@ PostgreSQL holds workflow and task state plus publication intent. Kafka delivers
 - KafkaJS
 - `pg` (node-postgres)
 
-## Current Architecture
+## Architecture
 
 ```text
                          PostgreSQL
@@ -55,81 +55,51 @@ Worker (engine/src/worker)
   └── insert new outbox rows for newly ready tasks
 ```
 
-The orchestrator does not publish to Kafka directly.
+The orchestrator never publishes to Kafka directly. It commits workflow state and outbox rows in one Postgres transaction. A relay polls unpublished rows and publishes them.
 
-Workflow state and outbox rows are written in the same PostgreSQL transaction. A separate relay polls unpublished outbox rows and publishes them to Kafka.
-
-This removes the failure window where a task could be scheduled in the database but never reach a worker.
+That closes the gap where a task is scheduled in the database but never reaches a worker.
 
 ## Demo
 
-<!-- TODO: Replace placeholders once you record the demo -->
+<!-- TODO: paste your video URL below (YouTube, GitHub upload, etc.) -->
 
-### Live demo
+**Demo video:** _[Add link — full stack run: workflow start, outbox relay, Kafka, worker, dependency unblocking]_
 
-| Resource | Link |
-|----------|------|
-| Interactive browser demo (local) | `http://localhost:3456` after `bun run demo` |
-| Deployed demo | _[Add URL — e.g. Vercel / Fly / Railway]_ |
-| Demo repository branch | _[Add branch or tag if you snapshot a stable demo]_ |
+Local browser demo (no Postgres/Kafka):
 
-### Screenshots and recordings
+```bash
+cd engine && bun run demo
+```
 
-<!-- Drop assets into ./assets/ and uncomment when ready -->
+Open `http://localhost:3456`, pick a preset, click Start workflow. The UI mirrors scheduling in `engine/src/index.ts` and worker logic in `engine/src/worker/worker.ts`.
 
-<!-- ![Order processing workflow — task graph and event log](./assets/demo-order-processing.png) -->
-
-<!-- ![User onboarding workflow — dependency unblocking](./assets/demo-user-onboarding.png) -->
-
-<!-- ![GIF — charge + reserve run in parallel, email waits for both](./assets/demo-workflow.gif) -->
-
-| Asset | Description | Status |
-|-------|-------------|--------|
-| `assets/demo-order-processing.png` | Order workflow DAG with all tasks completed | _Placeholder_ |
-| `assets/demo-user-onboarding.png` | Linear onboarding chain | _Placeholder_ |
-| `assets/demo-workflow.gif` | End-to-end run with event log scrolling | _Placeholder_ |
-| `assets/demo-architecture.mp4` | Walkthrough: Postgres → outbox → Kafka → worker | _Placeholder_ |
-
-### What the demo shows
-
-The browser demo (`engine/demo/`) simulates the same scheduling and dependency logic as the real engine:
-
-- **Order processing** — `charge` and `reserve` run in parallel; `email` waits for both
-- **User onboarding** — linear chain: verify → profile → welcome
-- Live **task graph** (pending → ready → running → completed)
-- Append-only **event log** mirroring `workflow_events`
-
-It does not connect to Postgres or Kafka; use it to explain the model before running the full stack.
-
-## Project Structure
+## Project structure
 
 ```text
 engine/
     src/
-        index.ts              Workflow start: create workflow, tasks, deps, outbox
-        db/client.ts            PostgreSQL connection pool
-        kafka/client.ts         Kafka producer / client config
+        index.ts              Start workflow, create tasks, deps, outbox
+        db/client.ts            Postgres connection pool
+        kafka/client.ts         Kafka producer and client config
         outbox/
             index.ts            Outbox relay loop
-            publisher.ts        Poll outbox, publish to Kafka, mark published_at
+            publisher.ts        Poll outbox, publish, set published_at
         worker/
-            worker.ts           Consume workflow-tasks, claim & execute tasks
+            worker.ts           Consume workflow-tasks, claim, execute
         migrations/
-            001_initial.sql     Schema: workflows, tasks, events, outbox
+            001_initial.sql     Schema
 
     demo/
-        serve.ts                Static file server for browser demo
-        index.html              Demo UI — task graph + event log
-        app.js                  In-browser engine simulation
-        styles.css              Demo styling
+        serve.ts                Static file server
+        index.html              Task graph and event log UI
+        app.js                  In-browser simulation
+        styles.css
 
     package.json
     tsconfig.json
 ```
 
-## Workflow Start Flow
-
-Starting a workflow follows this flow:
+## Starting a workflow
 
 ```text
 startWorkflow(definition)
@@ -148,9 +118,9 @@ startWorkflow(definition)
   └── COMMIT → return workflowId
 ```
 
-Tasks with dependencies start as `PENDING`. Tasks with no dependencies start as `READY` and get an outbox row immediately.
+Tasks with dependencies start as `PENDING`. Tasks with none start as `READY` and get an outbox row in the same transaction.
 
-### Example definition
+### Example
 
 ```typescript
 await startWorkflow({
@@ -170,7 +140,7 @@ await startWorkflow({
 });
 ```
 
-## Task Lifecycle
+## Task lifecycle
 
 ```text
 PENDING ──(all dependencies COMPLETED)──► READY
@@ -186,11 +156,11 @@ PENDING ──(all dependencies COMPLETED)──► READY
    │                          └── unblock dependents → READY + outbox
 ```
 
-Each task has a stable `operation_id` (`{workflowId}:{taskKey}`) used as an idempotency key when calling external activities.
+Each task has a stable `operation_id` (`{workflowId}:{taskKey}`). Pass it to external activities as an idempotency key.
 
-## Transactional Outbox
+## Transactional outbox
 
-The orchestrator writes scheduling intent to PostgreSQL first:
+Scheduling intent lands in Postgres first.
 
 ```text
 PostgreSQL transaction
@@ -202,7 +172,7 @@ PostgreSQL transaction
 COMMIT
 ```
 
-The outbox relay polls:
+The relay polls:
 
 ```sql
 SELECT id, workflow_id, task_id, event_type, payload
@@ -212,17 +182,15 @@ ORDER BY created_at
 LIMIT 100
 ```
 
-After successful Kafka delivery, the relay sets `published_at`.
+After Kafka accepts the message, the relay sets `published_at`. If publish fails, the row stays unpublished and the next poll retries it.
 
-If Kafka publication fails, the row stays unpublished and will be retried on the next poll.
+## Delivery semantics
 
-## Delivery Semantics
+Publication is at-least-once.
 
-The outbox provides **at-least-once publication** to Kafka.
+The relay can crash after Kafka acks but before `published_at` commits. The same row may publish twice.
 
-A relay can crash after Kafka acknowledges delivery but before `published_at` commits. The same outbox row may be published again.
-
-Workers mitigate duplicate delivery by claiming tasks with a conditional update:
+Workers handle duplicates with a conditional claim:
 
 ```sql
 UPDATE tasks
@@ -230,51 +198,48 @@ SET status = 'RUNNING', attempt_count = attempt_count + 1
 WHERE id = $1 AND status = 'READY'
 ```
 
-If the task is no longer `READY`, the worker skips execution.
+If status is not `READY`, the worker skips the message.
 
-## Worker Processing
+## Worker processing
 
-The worker:
+1. Consume from `workflow-tasks`.
+2. Claim the task (`READY` to `RUNNING`) in a transaction.
+3. Insert a `task_attempts` row.
+4. Run the activity (today a 1s sleep stub).
+5. On success, mark attempt and task `COMPLETED`, append `TASK_COMPLETED`, unblock dependents, insert outbox rows for newly ready tasks.
+6. On failure, mark attempt and task `FAILED`.
 
-1. consumes messages from `workflow-tasks`
-2. claims the task (`READY` → `RUNNING`) in a transaction
-3. inserts a `task_attempts` row
-4. executes the activity (currently a simulated 1s delay)
-5. on success: marks attempt and task `COMPLETED`, appends `TASK_COMPLETED` event
-6. checks dependent tasks — when all dependencies are `COMPLETED`, moves them to `READY` and inserts outbox rows
-7. on failure: marks attempt and task `FAILED`
+Kafka auto-commit is still default. Offset handling needs hardening before production.
 
-Kafka auto-commit behavior is not yet customized; offset management is an area for future hardening.
+## Database schema
 
-## Database Schema
-
-Core tables (see `engine/src/migrations/001_initial.sql`):
+See `engine/src/migrations/001_initial.sql`.
 
 | Table | Purpose |
 |-------|---------|
 | `workflows` | Workflow instance metadata and status |
-| `tasks` | Logical units of work with status and `operation_id` |
-| `task_dependencies` | DAG edges between tasks |
+| `tasks` | Work units with status and `operation_id` |
+| `task_dependencies` | DAG edges |
 | `task_attempts` | Per-attempt execution history |
-| `workflow_events` | Append-only event log with monotonic sequence |
-| `outbox` | Durable task-ready events pending Kafka publish |
+| `workflow_events` | Append-only log with per-workflow sequence |
+| `outbox` | Task-ready events waiting for Kafka |
 
-## How to Run
+## How to run
 
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/vinaybadgujar102/mini-temporal.git
 cd mini-temporal/engine
 ```
 
-### 2. Install dependencies
+### 2. Install
 
 ```bash
 bun install
 ```
 
-### 3. Configure environment
+### 3. Environment
 
 Create `engine/.env`:
 
@@ -282,14 +247,13 @@ Create `engine/.env`:
 DATABASE_URL=postgresql://admin:admin@localhost:5432/mini_temporal
 ```
 
-<!-- TODO: Add docker-compose.yml for Postgres + Kafka -->
+<!-- TODO: add docker-compose.yml -->
 
-### 4. Start PostgreSQL and Kafka
+### 4. Postgres and Kafka
 
-_Infra setup is manual for now. Suggested local stack:_
+Manual setup for now.
 
 ```bash
-# PostgreSQL — example with Docker
 docker run -d --name mini-temporal-pg \
   -e POSTGRES_USER=admin \
   -e POSTGRES_PASSWORD=admin \
@@ -297,27 +261,26 @@ docker run -d --name mini-temporal-pg \
   -p 5432:5432 \
   postgres:16
 
-# Kafka — example with Docker (adjust image/version as needed)
 docker run -d --name mini-temporal-kafka \
   -p 9092:9092 \
   apache/kafka:latest
 ```
 
-_Create `docker-compose.yml` here when you wire up a one-command stack._
+Add `docker-compose.yml` when you want one command for infra.
 
-### 5. Initialize the database
+### 5. Migrate
 
 ```bash
 psql "$DATABASE_URL" -f src/migrations/001_initial.sql
 ```
 
-### 6. Start the outbox relay
+### 6. Outbox relay
 
 ```bash
 bun src/outbox/index.ts
 ```
 
-### 7. Start the worker
+### 7. Worker
 
 ```bash
 bun src/worker/worker.ts
@@ -329,110 +292,79 @@ bun src/worker/worker.ts
 bun src/index.ts
 ```
 
-This runs the bundled order-processing example and prints the new `workflowId`.
+Runs the bundled order-processing example and prints `workflowId`.
 
-### 9. Run the browser demo (no infra required)
+### 9. Browser demo (no infra)
 
 ```bash
 bun run demo
 ```
 
-Open `http://localhost:3456`, pick a workflow preset, and click **Start workflow**.
+Open `http://localhost:3456`, pick a preset, click Start workflow.
 
 ## Testing
 
-<!-- TODO: Add tests -->
+<!-- TODO: add tests -->
 
 ```bash
-# Planned
 bun test
 ```
 
-Integration coverage to add:
+Planned integration coverage:
 
-- workflow start creates correct tasks and initial outbox rows
-- dependency unblocking after parent task completion
-- worker skip when task is not READY (duplicate Kafka delivery)
-- outbox relay retry after Kafka failure
-- relay crash after publish (at-least-once semantics)
+- workflow start creates tasks and initial outbox rows
+- dependency unblocking after parent completion
+- worker skips when task is not READY (duplicate delivery)
+- relay retry after Kafka failure
+- relay crash after publish (at-least-once)
 
-## Key Reliability Properties
+## Reliability properties
 
-### Durable workflow state
+- **Durable state.** Workflows, tasks, deps, and history live in Postgres and survive restarts.
+- **Atomic scheduling.** Worker completion updates task state and inserts outbox rows in one transaction.
+- **Transactional outbox.** Ready tasks stay in Postgres if relay or Kafka is down.
+- **Task claiming.** `UPDATE ... WHERE status = 'READY'` blocks double execution on duplicate messages.
+- **Idempotent activities.** Stable `operation_id` per task for external calls.
+- **Append-only history.** `workflow_events` stores `WORKFLOW_STARTED`, `TASK_READY`, `TASK_COMPLETED` with monotonic sequence per workflow.
 
-Workflows, tasks, dependencies, and history survive process restarts in PostgreSQL.
+## Current limitations
 
-### Atomic scheduling
+- Activities are a sleep stub, not real integrations.
+- No HTTP API. Start workflows via CLI or `startWorkflow()` directly.
+- No `WORKFLOW_COMPLETED` in the DB path yet.
+- No retry policy, backoff, or DLQ for failed tasks.
+- Relay publishes one row at a time, no `FOR UPDATE SKIP LOCKED`.
+- No `docker-compose.yml`.
+- Kafka offsets not tuned for production.
+- No metrics or tracing.
+- Browser demo is separate from Postgres and Kafka.
 
-Task state changes and outbox inserts for newly ready tasks happen in one transaction inside the worker completion path.
-
-### Transactional outbox
-
-Ready tasks are not lost if the relay or Kafka is temporarily unavailable.
-
-### Task claiming
-
-Workers use conditional `UPDATE ... WHERE status = 'READY'` to avoid double execution under duplicate delivery.
-
-### Idempotent activities
-
-Each task carries a stable `operation_id` intended for idempotent external side effects.
-
-### Append-only history
-
-`workflow_events` records `WORKFLOW_STARTED`, `TASK_READY`, and `TASK_COMPLETED` with per-workflow sequence numbers.
-
-## Current Limitations
-
-This project intentionally leaves several areas open:
-
-- activities are simulated (sleep), not real external integrations
-- no HTTP API for starting workflows — CLI / direct function call only
-- no workflow completion detection or `WORKFLOW_COMPLETED` event in the DB path
-- no retry policy, backoff, or dead-letter queue for failed tasks
-- outbox relay publishes rows one-by-one without `FOR UPDATE SKIP LOCKED`
-- no `docker-compose.yml` for one-command local setup
-- Kafka consumer offset strategy not tuned for production
-- no observability (metrics, tracing, dashboards)
-- browser demo is disconnected from the real Postgres + Kafka stack
-
-## Future Improvements
+## Planned work
 
 - HTTP API to start and query workflows
-- `docker-compose.yml` for Postgres + Kafka + app processes
-- workflow completion and failure terminal states
-- configurable retry with exponential backoff
-- dead-letter topic for permanently failed tasks
-- real activity implementations with idempotency keys
-- outbox relay concurrency with row locking
-- record demo assets under `assets/` and link deployed demo URL
-- unit and integration tests with `bun test`
+- `docker-compose.yml` for Postgres, Kafka, and app processes
+- Workflow completion and terminal failure states
+- Retry with exponential backoff
+- Dead-letter topic for poison tasks
+- Real activities with idempotency keys
+- Concurrent relay with row locking
+- Recorded demo video linked from README
+- `bun test` integration suite
 - GitHub Actions CI
-- OpenTelemetry tracing across orchestrator, relay, and worker
+- OpenTelemetry across orchestrator, relay, and worker
 
-## Documentation
-
-<!-- TODO: Add ADRs and postmortems as the design evolves -->
-
-Architecture decisions (planned):
+## Documentation (planned)
 
 ```text
 docs/adr/001-transactional-outbox.md
 docs/adr/002-task-claiming-and-idempotency.md
 docs/adr/003-workflow-event-sourcing.md
-```
-
-Failure analysis (planned):
-
-```text
 docs/postmortems/duplicate-kafka-delivery.md
 docs/postmortems/outbox-relay-crash.md
 ```
 
-## Let's Connect
-
-If you'd like to discuss workflow engines, distributed systems, or event-driven architecture:
+## Contact
 
 - GitHub: [@vinaybadgujar102](https://github.com/vinaybadgujar102)
-- LinkedIn: _[Add your LinkedIn URL]_
-- Email: _[Add your email]_
+- LinkedIn: [Vinay Badgujar](https://www.linkedin.com/in/badgujarvinay/)
+- Email: [vinaybadgujar8@gmail.com](mailto:vinaybadgujar8@gmail.com)
