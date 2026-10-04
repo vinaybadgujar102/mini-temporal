@@ -3,6 +3,9 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "demo": "bun --hot demo/serve.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },

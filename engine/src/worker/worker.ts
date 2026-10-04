@@ -75,10 +75,10 @@ async function executeTask(taskId: string) {
       return;
     }
 
-    const task = result.rows[0];
+    task = result.rows[0];
 
     await client.query(
-      `INSERT INTO task_attemps (
+      `INSERT INTO task_attempts (
   id, task_id, attempt_number, status, started_at
 ) VALUES ($1, $2, $3, 'RUNNING', NOW())
 `,
@@ -241,6 +241,152 @@ async function executeTask(taskId: string) {
        *
        * We'll implement this next.
        */
+
+      const sequenceResult = await client.query(
+        `
+      SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+      FROM workflow_events
+      WHERE workflow_id = (
+        SELECT workflow_id
+        FROM tasks
+        WHERE id = $1
+      )
+      `,
+        [taskId],
+      );
+
+      let sequence = Number(sequenceResult.rows[0].sequence);
+
+      const workflowResult = await client.query(
+        `
+      SELECT workflow_id
+      FROM tasks
+      WHERE id = $1
+      `,
+        [taskId],
+      );
+
+      const workflowId = workflowResult.rows[0].workflow_id;
+
+      await client.query(
+        `
+      INSERT INTO workflow_events (
+        id,
+        workflow_id,
+        sequence,
+        event_type,
+        data
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      `,
+        [
+          crypto.randomUUID(),
+          workflowId,
+          sequence++,
+          "TASK_COMPLETED",
+          JSON.stringify({
+            taskId,
+            result,
+          }),
+        ],
+      );
+
+      const dependentTasks = await client.query(
+        `
+      SELECT task_id
+      FROM task_dependencies
+      WHERE depends_on_task_id = $1
+      `,
+        [taskId],
+      );
+
+      for (const row of dependentTasks.rows) {
+        const dependentTaskId = row.task_id;
+
+        const dependencyCheck = await client.query(
+          `
+        SELECT COUNT(*) AS remaining
+        FROM task_dependencies td
+        JOIN tasks dependency
+          ON dependency.id = td.depends_on_task_id
+        WHERE td.task_id = $1
+          AND dependency.status != 'COMPLETED'
+        `,
+          [dependentTaskId],
+        );
+        const remaining = Number(dependencyCheck.rows[0].remaining);
+
+        if (remaining !== 0) {
+          continue;
+        }
+
+        const readyResult = await client.query(
+          `
+        UPDATE tasks
+        SET
+          status = 'READY',
+          updated_at = NOW()
+        WHERE id = $1
+          AND status = 'PENDING'
+        RETURNING id, workflow_id, type, name
+        `,
+          [dependentTaskId],
+        );
+
+        if (readyResult.rowCount === 0) {
+          continue;
+        }
+
+        const readyTask = readyResult.rows[0];
+
+        // 8. Record TASK_READY
+        await client.query(
+          `
+        INSERT INTO workflow_events (
+          id,
+          workflow_id,
+          sequence,
+          event_type,
+          data
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+          [
+            crypto.randomUUID(),
+            workflowId,
+            sequence++,
+            "TASK_READY",
+            JSON.stringify({
+              taskId: readyTask.id,
+            }),
+          ],
+        );
+
+        // 9. Create outbox message
+        await client.query(
+          `
+        INSERT INTO outbox (
+          id,
+          workflow_id,
+          task_id,
+          event_type,
+          payload
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+          [
+            crypto.randomUUID(),
+            workflowId,
+            readyTask.id,
+            "TASK_READY",
+            JSON.stringify({
+              workflowId,
+              taskId: readyTask.id,
+              taskType: readyTask.type,
+            }),
+          ],
+        );
+      }
 
       await client.query("COMMIT");
     } catch (error) {

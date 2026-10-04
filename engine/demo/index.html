@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mini-temporal — workflow demo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,400;0,500&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="masthead">
+        <div class="masthead-text">
+          <h1>mini-temporal</h1>
+          <p class="lede">
+            Durable workflow orchestration — tasks persist, dependencies gate
+            execution, workers claim work idempotently.
+          </p>
+        </div>
+        <div class="controls">
+          <label class="preset-picker" for="preset">
+            <span>Workflow</span>
+            <select id="preset" aria-label="Choose workflow preset">
+              <option value="order">Order processing</option>
+              <option value="onboarding">User onboarding</option>
+            </select>
+          </label>
+          <button type="button" id="start-btn" class="btn-primary">
+            Start workflow
+          </button>
+          <button type="button" id="reset-btn" class="btn-ghost" hidden>
+            Reset
+          </button>
+        </div>
+      </header>
+
+      <main class="stage">
+        <section class="dag-panel" aria-label="Task graph">
+          <div class="panel-head">
+            <h2>Task graph</h2>
+            <dl class="workflow-meta" id="workflow-meta">
+              <div>
+                <dt>Status</dt>
+                <dd id="wf-status">—</dd>
+              </div>
+              <div>
+                <dt>ID</dt>
+                <dd id="wf-id" class="mono">—</dd>
+              </div>
+            </dl>
+          </div>
+          <div class="dag-canvas-wrap">
+            <svg
+              id="dag-svg"
+              viewBox="0 0 520 280"
+              role="img"
+              aria-label="Workflow task dependency graph"
+            >
+              <defs>
+                <marker
+                  id="arrow"
+                  viewBox="0 0 10 10"
+                  refX="9"
+                  refY="5"
+                  markerWidth="6"
+                  markerHeight="6"
+                  orient="auto-start-reverse"
+                >
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+                </marker>
+              </defs>
+              <g id="dag-edges"></g>
+              <g id="dag-nodes"></g>
+            </svg>
+            <p class="dag-empty" id="dag-empty">
+              Start a workflow to see tasks move through
+              pending → ready → running → completed.
+            </p>
+          </div>
+          <ul class="legend" aria-label="Task status legend">
+            <li><span class="dot pending"></span> Pending</li>
+            <li><span class="dot ready"></span> Ready</li>
+            <li><span class="dot running"></span> Running</li>
+            <li><span class="dot completed"></span> Completed</li>
+            <li><span class="dot failed"></span> Failed</li>
+          </ul>
+        </section>
+
+        <section class="log-panel" aria-label="Event log">
+          <div class="panel-head">
+            <h2>Event log</h2>
+            <p class="panel-note">Append-only history, same as workflow_events</p>
+          </div>
+          <ol class="event-log" id="event-log" reversed></ol>
+          <p class="log-empty" id="log-empty">No events yet.</p>
+        </section>
+      </main>
+
+      <footer class="footnote">
+        <p>
+          Browser simulation of the Postgres + Kafka engine. Task states and
+          dependency unblocking mirror
+          <code>engine/src/index.ts</code> and
+          <code>engine/src/worker/worker.ts</code>.
+        </p>
+      </footer>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
