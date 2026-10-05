@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: mini-temporal-pg
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: mini_temporal
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d mini_temporal"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:latest
+    container_name: mini-temporal-kafka
+    ports:
+      - "9092:9092"

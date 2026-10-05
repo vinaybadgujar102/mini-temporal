@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import { Kafka } from "kafkajs";
+import type { PoolClient } from "pg";
 import { pool } from "../db/client";
+import { chargePayment } from "../external/paymentService";
 
 const kafka = new Kafka({
   clientId: "mini-temporal-worker",
@@ -372,6 +374,8 @@ async function completeAttempt(
       ],
     );
 
+    await scheduleUnblockedDependents(client, workflowId, taskId, sequence);
+
     await client.query("COMMIT");
 
     return true;
@@ -452,17 +456,171 @@ async function executeActivity({
   operationId: string;
   type: string;
 }) {
-  console.log(`[activity] executing ${type}`);
-
-  console.log(`[activity] idempotency key: ${operationId}`);
+  if (type === "CHARGE_PAYMENT") {
+    return chargePayment(operationId, 1000);
+  }
 
   await new Promise((resolve) => setTimeout(resolve, 1_000));
 
   return {
-    transactionId: crypto.randomUUID(),
     operationId,
     success: true,
   };
+}
+
+function taskKeyFrom(workflowId: string, operationId: string) {
+  const prefix = `${workflowId}:`;
+  return operationId.startsWith(prefix)
+    ? operationId.slice(prefix.length)
+    : operationId;
+}
+
+async function scheduleUnblockedDependents(
+  client: PoolClient,
+  workflowId: string,
+  completedTaskId: string,
+  sequenceStart: number,
+) {
+  let sequence = sequenceStart;
+
+  const dependents = await client.query(
+    `
+    SELECT
+      child.id,
+      child.type,
+      child.operation_id
+    FROM task_dependencies d
+    JOIN tasks child ON child.id = d.task_id
+    WHERE d.depends_on_task_id = $1
+      AND child.status = 'PENDING'
+    `,
+    [completedTaskId],
+  );
+
+  for (const child of dependents.rows) {
+    const blocked = await client.query(
+      `
+      SELECT 1
+      FROM task_dependencies d
+      JOIN tasks dep ON dep.id = d.depends_on_task_id
+      WHERE d.task_id = $1
+        AND dep.status <> 'COMPLETED'
+      LIMIT 1
+      `,
+      [child.id],
+    );
+
+    if ((blocked.rowCount ?? 0) > 0) continue;
+
+    await client.query(
+      `
+      UPDATE tasks
+      SET
+        status = 'READY',
+        updated_at = NOW()
+      WHERE id = $1
+        AND status = 'PENDING'
+      `,
+      [child.id],
+    );
+
+    const taskKey = taskKeyFrom(workflowId, String(child.operation_id));
+
+    await client.query(
+      `
+      INSERT INTO workflow_events (
+        id,
+        workflow_id,
+        sequence,
+        event_type,
+        data
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      `,
+      [
+        crypto.randomUUID(),
+        workflowId,
+        sequence++,
+        "TASK_READY",
+        JSON.stringify({
+          taskId: child.id,
+          taskKey,
+          taskType: child.type,
+        }),
+      ],
+    );
+
+    await client.query(
+      `
+      INSERT INTO outbox (
+        id,
+        workflow_id,
+        task_id,
+        event_type,
+        payload
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      `,
+      [
+        crypto.randomUUID(),
+        workflowId,
+        child.id,
+        "TASK_READY",
+        JSON.stringify({
+          workflowId,
+          taskId: child.id,
+          taskKey,
+          taskType: child.type,
+          operationId: child.operation_id,
+        }),
+      ],
+    );
+  }
+
+  const open = await client.query(
+    `
+    SELECT 1
+    FROM tasks
+    WHERE workflow_id = $1
+      AND status <> 'COMPLETED'
+    LIMIT 1
+    `,
+    [workflowId],
+  );
+
+  if ((open.rowCount ?? 0) > 0) return;
+
+  await client.query(
+    `
+    UPDATE workflows
+    SET
+      status = 'COMPLETED',
+      updated_at = NOW()
+    WHERE id = $1
+      AND status = 'RUNNING'
+    `,
+    [workflowId],
+  );
+
+  await client.query(
+    `
+    INSERT INTO workflow_events (
+      id,
+      workflow_id,
+      sequence,
+      event_type,
+      data
+    )
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [
+      crypto.randomUUID(),
+      workflowId,
+      sequence++,
+      "WORKFLOW_COMPLETED",
+      JSON.stringify({ workflowId }),
+    ],
+  );
 }
 
 startWorker().catch((error) => {

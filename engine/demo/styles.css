@@ -12,6 +12,8 @@
   --running: #f97066;
   --completed: #2dd4bf;
   --failed: #e5484d;
+  --timed-out: #e8a87c;
+  --recovered: #6ea8d9;
 
   --font-serif: "Libre Baskerville", Georgia, serif;
   --font-mono: "DM Mono", ui-monospace, monospace;
@@ -43,7 +45,7 @@ body {
 }
 
 .shell {
-  max-width: 72rem;
+  max-width: 84rem;
   margin: 0 auto;
   padding: 2rem 1.25rem 3rem;
 }
@@ -93,6 +95,7 @@ body {
 
 .preset-picker select {
   min-width: 11rem;
+  min-height: 2.5rem;
   padding: 0.5rem 0.65rem;
   font-family: var(--font-mono);
   font-size: 0.8125rem;
@@ -111,6 +114,7 @@ body {
 button {
   font-family: var(--font-mono);
   font-size: 0.8125rem;
+  min-height: 2.5rem;
   cursor: pointer;
   border-radius: 2px;
   transition: background 0.15s var(--ease-out), border-color 0.15s var(--ease-out);
@@ -139,9 +143,137 @@ button {
   border: 1px solid var(--line);
 }
 
-.btn-ghost:hover {
+.btn-ghost:hover:not(:disabled) {
   color: var(--paper);
   border-color: var(--paper-dim);
+}
+
+.btn-ghost:disabled,
+.btn-crash:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-crash {
+  padding: 0.5rem 0.85rem;
+  color: var(--running);
+  background: transparent;
+  border: 1px solid var(--running);
+}
+
+.btn-crash.need-action,
+.btn-ghost.need-action {
+  animation: pulse-ring 1.2s ease-in-out infinite;
+}
+
+.btn-crash.need-action {
+  color: var(--ink);
+  background: var(--running);
+  border-color: var(--running);
+}
+
+.guide {
+  margin: -1.5rem 0 1.75rem;
+}
+
+.beats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--paper-dim);
+  counter-reset: beat;
+}
+
+.beats li {
+  counter-increment: beat;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.beats li::before {
+  content: counter(beat);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  font-size: 0.625rem;
+  border: 1px solid var(--line);
+  color: var(--paper-dim);
+}
+
+.beats li.current {
+  color: var(--paper);
+}
+
+.beats li.current::before {
+  border-color: var(--ready);
+  color: var(--ink);
+  background: var(--ready);
+}
+
+.beats li.done {
+  color: var(--completed);
+}
+
+.beats li.done::before {
+  border-color: var(--completed);
+  color: var(--completed);
+}
+
+.beats[hidden] {
+  display: none;
+}
+
+.narration {
+  margin: 0;
+  max-width: 62ch;
+  font-size: 0.875rem;
+  color: var(--paper);
+}
+
+.consumers {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.consumer {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.45rem 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  border: 1px solid var(--line);
+  background: var(--ink);
+}
+
+.consumer-id {
+  color: var(--paper-dim);
+}
+
+.consumer-state {
+  color: var(--paper);
+}
+
+.consumer.live {
+  border-color: var(--running);
+}
+
+.consumer.dead {
+  border-color: var(--failed);
+}
+
+.consumer.skip {
+  border-color: var(--pending);
 }
 
 button:focus-visible {
@@ -189,6 +321,12 @@ button:focus-visible {
   border-radius: 3px;
 }
 
+.side-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
 .workflow-meta {
   display: flex;
   flex-wrap: wrap;
@@ -222,7 +360,7 @@ button:focus-visible {
 
 .dag-canvas-wrap {
   position: relative;
-  min-height: 280px;
+  min-height: 360px;
   margin-bottom: 1rem;
 }
 
@@ -255,6 +393,14 @@ button:focus-visible {
   cursor: default;
 }
 
+.dag-node.running {
+  cursor: default;
+}
+
+.dag-node.crashable {
+  cursor: pointer;
+}
+
 .dag-node rect {
   fill: var(--ink);
   stroke-width: 1.5;
@@ -270,9 +416,9 @@ button:focus-visible {
   fill: #1a1810;
 }
 
-.dag-node.running rect {
+.dag-node.crashable rect {
   stroke: var(--running);
-  fill: #1f1413;
+  stroke-width: 2.5;
 }
 
 .dag-node.completed rect {
@@ -377,6 +523,83 @@ button:focus-visible {
   background: var(--failed);
 }
 
+.lease-bar {
+  fill: var(--running);
+  pointer-events: none;
+}
+
+.subpanel {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.subpanel h3 {
+  margin: 0 0 0.25rem;
+  font-size: 0.9375rem;
+  font-weight: 400;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+}
+
+.data-table th,
+.data-table td {
+  padding: 0.4rem 0.45rem 0.4rem 0;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--line);
+}
+
+.data-table th {
+  color: var(--paper-dim);
+  font-weight: 400;
+}
+
+.data-table td {
+  color: var(--paper);
+}
+
+.data-table[hidden] {
+  display: none;
+}
+
+.status-chip {
+  color: var(--paper-dim);
+}
+
+.status-chip.running {
+  color: var(--running);
+}
+
+.status-chip.completed {
+  color: var(--completed);
+}
+
+.status-chip.failed {
+  color: var(--failed);
+}
+
+.status-chip.timed_out {
+  color: var(--timed-out);
+}
+
+.hit-first {
+  color: var(--completed);
+}
+
+.hit-dup {
+  color: var(--timed-out);
+}
+
 /* Event log */
 
 .event-log {
@@ -460,6 +683,60 @@ button:focus-visible {
 
 .event-item.type-WORKFLOW_COMPLETED .event-type {
   color: var(--completed);
+}
+
+.event-item.type-TASK_RECOVERY .event-type {
+  color: var(--recovered);
+}
+
+.event-item.type-WORKER_CRASHED .event-type {
+  color: var(--running);
+}
+
+.event-item.type-STALE_RESULT_REJECTED .event-type {
+  color: var(--failed);
+}
+
+.event-item.type-CLAIM_WON .event-type {
+  color: var(--completed);
+}
+
+.event-item.type-CLAIM_SKIPPED .event-type {
+  color: var(--pending);
+}
+
+.engine-detail {
+  padding: 1.25rem;
+  background: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+
+.engine-detail summary {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.engine-detail summary:focus-visible {
+  outline: 2px solid var(--ready);
+  outline-offset: 2px;
+}
+
+.engine-detail pre {
+  margin: 0.75rem 0 0;
+  max-height: 12rem;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  line-height: 1.45;
+  color: var(--paper-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.engine-detail[hidden] {
+  display: none;
 }
 
 /* Footer */

@@ -4,7 +4,12 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "demo": "bun --hot demo/serve.ts"
+    "demo": "bun --hot demo/serve.ts",
+    "infra": "docker compose up -d",
+    "migrate": "psql \"$DATABASE_URL\" -f src/migrations/001_initial.sql && psql \"$DATABASE_URL\" -f src/migrations/002_add_fencing_token.sql && psql \"$DATABASE_URL\" -f src/migrations/003_add_payment_operations.sql",
+    "outbox": "bun src/outbox/index.ts",
+    "worker": "bun src/worker/worker.ts",
+    "start-workflow": "bun src/index.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

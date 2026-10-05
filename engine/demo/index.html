@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>mini-temporal — workflow demo</title>
+    <title>mini-temporal — crash and recover lab</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -18,26 +18,49 @@
         <div class="masthead-text">
           <h1>mini-temporal</h1>
           <p class="lede">
-            Durable workflow orchestration — tasks persist, dependencies gate
-            execution, workers claim work idempotently.
+            Crash a worker. The task stays running. Wait out the lease. Recover
+            it yourself. Two consumers then race one claim — only one wins.
           </p>
         </div>
         <div class="controls">
-          <label class="preset-picker" for="preset">
+          <label class="preset-picker" id="preset-wrap" for="preset" hidden>
             <span>Workflow</span>
-            <select id="preset" aria-label="Choose workflow preset">
-              <option value="order">Order processing</option>
+            <select id="preset" aria-label="Choose workflow">
               <option value="onboarding">User onboarding</option>
+              <option value="order">Order fulfillment</option>
             </select>
           </label>
-          <button type="button" id="start-btn" class="btn-primary">
+          <button type="button" id="start-lab-btn" class="btn-primary">
+            Start lab
+          </button>
+          <button type="button" id="start-free-btn" class="btn-ghost" hidden>
             Start workflow
           </button>
+          <button type="button" id="crash-btn" class="btn-crash" disabled>
+            Crash worker
+          </button>
+          <button type="button" id="recover-btn" class="btn-ghost" disabled>
+            Recover stale
+          </button>
           <button type="button" id="reset-btn" class="btn-ghost" hidden>
-            Reset
+            Start over
           </button>
         </div>
       </header>
+
+      <div class="guide">
+        <ol class="beats" id="beats" aria-label="Lab steps">
+          <li data-beat="start">Start</li>
+          <li data-beat="crash">Crash</li>
+          <li data-beat="wait-lease">Wait</li>
+          <li data-beat="recover">Recover</li>
+          <li data-beat="watch">Race</li>
+        </ol>
+        <p class="narration" id="narration" aria-live="polite">
+          Start the lab. Verify Email will run and wait until you crash its
+          worker.
+        </p>
+      </div>
 
       <main class="stage">
         <section class="dag-panel" aria-label="Task graph">
@@ -54,6 +77,18 @@
               </div>
             </dl>
           </div>
+
+          <div class="consumers" id="consumers" aria-label="Competing consumers">
+            <div class="consumer" id="consumer-A">
+              <span class="consumer-id">A</span>
+              <span class="consumer-state">idle</span>
+            </div>
+            <div class="consumer" id="consumer-B">
+              <span class="consumer-id">B</span>
+              <span class="consumer-state">idle</span>
+            </div>
+          </div>
+
           <div class="dag-canvas-wrap">
             <svg
               id="dag-svg"
@@ -78,35 +113,87 @@
               <g id="dag-nodes"></g>
             </svg>
             <p class="dag-empty" id="dag-empty">
-              Start a workflow to see tasks move through
-              pending → ready → running → completed.
+              Start the lab to run a three-step signup. You crash the first
+              worker, wait out the lease, then recover.
             </p>
           </div>
           <ul class="legend" aria-label="Task status legend">
-            <li><span class="dot pending"></span> Pending</li>
+            <li><span class="dot pending"></span> Waiting on others</li>
             <li><span class="dot ready"></span> Ready</li>
             <li><span class="dot running"></span> Running</li>
-            <li><span class="dot completed"></span> Completed</li>
+            <li><span class="dot completed"></span> Done</li>
             <li><span class="dot failed"></span> Failed</li>
           </ul>
+
+          <div class="subpanel">
+            <h3>Attempts</h3>
+            <p class="panel-note">
+              Each try has a worker, a lease, and a status.
+            </p>
+            <div class="table-wrap">
+              <table class="data-table" id="attempt-table" hidden>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Task</th>
+                    <th>Who</th>
+                    <th>Worker</th>
+                    <th>Lease</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="attempt-rows"></tbody>
+              </table>
+            </div>
+            <p class="log-empty" id="attempt-empty">No attempts yet.</p>
+          </div>
         </section>
 
-        <section class="log-panel" aria-label="Event log">
-          <div class="panel-head">
-            <h2>Event log</h2>
-            <p class="panel-note">Append-only history, same as workflow_events</p>
-          </div>
-          <ol class="event-log" id="event-log" reversed></ol>
-          <p class="log-empty" id="log-empty">No events yet.</p>
-        </section>
+        <div class="side-stack">
+          <section class="log-panel" aria-label="What happened">
+            <div class="panel-head">
+              <h2>What happened</h2>
+              <p class="panel-note">Newest first</p>
+            </div>
+            <ol class="event-log" id="event-log" reversed></ol>
+            <p class="log-empty" id="log-empty">Nothing yet. Start the lab.</p>
+          </section>
+
+          <section class="log-panel" id="pay-panel" aria-label="Payment operations" hidden>
+            <div class="panel-head">
+              <h2>Payment operations</h2>
+              <p class="panel-note">
+                Same charge key returns the same transaction.
+              </p>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="pay-table" hidden>
+                <thead>
+                  <tr>
+                    <th>Key</th>
+                    <th>Txn</th>
+                    <th>Amount</th>
+                    <th>Hit</th>
+                  </tr>
+                </thead>
+                <tbody id="pay-rows"></tbody>
+              </table>
+            </div>
+            <p class="log-empty" id="pay-empty">No charges yet.</p>
+          </section>
+
+          <details class="engine-detail" id="engine-detail" hidden>
+            <summary>Engine detail</summary>
+            <pre id="engine-json"></pre>
+          </details>
+        </div>
       </main>
 
       <footer class="footnote">
         <p>
-          Browser simulation of the Postgres + Kafka engine. Task states and
-          dependency unblocking mirror
-          <code>engine/src/index.ts</code> and
-          <code>engine/src/worker/worker.ts</code>.
+          Recover is disabled until the lease hits 0 on purpose. That wait is
+          the lesson. After the lab, crash any running node, or switch to order
+          fulfillment.
         </p>
       </footer>
     </div>
