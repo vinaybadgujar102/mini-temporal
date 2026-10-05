@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { Kafka } from "kafkajs";
 import { pool } from "../db/client";
 
@@ -12,7 +13,9 @@ const consumer = kafka.consumer({
 
 const TOPIC = "workflow-tasks";
 
-type TaskMesasge = {
+const LEASE_SECONDS = 30;
+
+type TaskMessage = {
   outboxId: string;
   workflowId: string;
   taskId: string;
@@ -20,8 +23,23 @@ type TaskMesasge = {
   payload: {
     taskId: string;
     taskKey: string;
-    taskTypes: string;
+    taskType: string;
   };
+};
+
+type ClaimedTask = {
+  id: string;
+  workflow_id: string;
+  type: string;
+  operation_id: string;
+  attempt_count: number;
+};
+
+type ClaimedAttempt = {
+  id: string;
+  attempt_number: number;
+  fencing_token: number;
+  worker_id: string;
 };
 
 export async function startWorker() {
@@ -38,238 +56,299 @@ export async function startWorker() {
         return;
       }
 
-      const taskMessage: TaskMesasge = JSON.parse(message.value.toString());
+      const taskMessage: TaskMessage = JSON.parse(message.value.toString());
 
-      console.log("Recieved", taskMessage);
+      console.log(`[worker] received task ${taskMessage.taskId}`);
 
       await executeTask(taskMessage.taskId);
     },
   });
 }
 
+/**
+ * Main task execution lifecycle:
+ *
+ * Kafka message
+ *      ↓
+ * Claim task + create attempt
+ *      ↓
+ * Heartbeat while executing
+ *      ↓
+ * External activity
+ *      ↓
+ * Fenced completion
+ */
 async function executeTask(taskId: string) {
-  const client = await pool.connect();
+  const workerId = crypto.randomUUID();
 
-  let task: any;
+  const claimed = await claimTask(taskId, workerId);
 
-  try {
-    await client.query("BEGIN");
-
-    const result = await client.query(
-      `
-  UPDATE tasks
-  SET
-    status = 'RUNNING',
-    attempt_count = attempt_count + 1,
-    updated_at = NOW()
-  WHERE id = $1
-    AND status = 'READY'
-  RETURNING *;
-  `,
-      [taskId],
-    );
-
-    if (result.rowCount === 0) {
-      await client.query("ROLLBACK");
-      console.log("Task does not exist:", taskId);
-      return;
-    }
-
-    task = result.rows[0];
-
-    await client.query(
-      `INSERT INTO task_attempts (
-  id, task_id, attempt_number, status, started_at
-) VALUES ($1, $2, $3, 'RUNNING', NOW())
-`,
-      [crypto.randomUUID(), task.id, task.attempt_count],
-    );
-
-    await client.query("COMMIT");
-
-    console.log(`Task ${task.id} claimed. Attempt ${task.attempt_count}`);
-  } catch (error) {
-    await client.query(`ROLLBACK`);
-    throw error;
-  } finally {
-    client.release();
-  }
-
-  let activityResult;
-
-  try {
-    activityResult = await executeActivity({
-      operationId: task.operation_id,
-      type: task.type,
-    });
-  } catch (error) {
-    await markAttemptFailed(task.id, task.attempt_count, error);
+  if (!claimed) {
+    console.log(`[worker] task ${taskId} was already claimed`);
 
     return;
   }
 
-  await markTaskCompleted(task.id, task.attempt_count, activityResult);
+  const { task, attempt } = claimed;
 
-  /*
-   * Fake external service for now.
-   *
-   * Later we'll turn this into a real
-   * idempotent external service.
-   */
-  async function executeActivity({
-    operationId,
-    type,
-  }: {
-    operationId: string;
-    type: string;
-  }) {
-    console.log(`Executing ${type} with idempotency key ${operationId}`);
+  console.log(
+    `[worker] claimed task=${task.id} ` +
+      `attempt=${attempt.attempt_number} ` +
+      `token=${attempt.fencing_token}`,
+  );
 
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+  // Heartbeat every 10 seconds.
+  const heartbeatTimer = setInterval(async () => {
+    try {
+      const alive = await heartbeat(
+        attempt.id,
+        workerId,
+        attempt.fencing_token,
+      );
+
+      if (!alive) {
+        console.log(`[worker] lost ownership of attempt ${attempt.id}`);
+
+        clearInterval(heartbeatTimer);
+      }
+    } catch (error) {
+      console.error("[worker] heartbeat failed", error);
+    }
+  }, 10_000);
+
+  try {
+    const result = await executeActivity({
+      operationId: task.operation_id,
+      type: task.type,
+    });
+
+    console.log(`[worker] activity succeeded for ${task.id}`);
+
+    if (process.env.CRASH_AFTER_ACTIVITY === "true") {
+      console.log("[worker] 💥 crashing after activity");
+
+      process.exit(1);
+    }
+
+    const completed = await completeAttempt(
+      task.id,
+      attempt.id,
+      workerId,
+      attempt.fencing_token,
+      result,
+    );
+
+    if (!completed) {
+      console.log(`[worker] stale result rejected for ${task.id}`);
+    }
+  } catch (error) {
+    await failAttempt(
+      task.id,
+      attempt.id,
+      workerId,
+      attempt.fencing_token,
+      error,
+    );
+  } finally {
+    clearInterval(heartbeatTimer);
+  }
+}
+
+async function claimTask(
+  taskId: string,
+  workerId: string,
+): Promise<{
+  task: ClaimedTask;
+  attempt: ClaimedAttempt;
+} | null> {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const taskResult = await client.query(
+      `
+      UPDATE tasks
+      SET
+        status = 'RUNNING',
+        attempt_count = attempt_count + 1,
+        updated_at = NOW()
+      WHERE id = $1
+        AND status = 'READY'
+      RETURNING
+        id,
+        workflow_id,
+        type,
+        operation_id,
+        attempt_count;
+      `,
+      [taskId],
+    );
+
+    if (taskResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+
+      return null;
+    }
+
+    const task = taskResult.rows[0] as ClaimedTask;
+
+    const fencingToken = task.attempt_count;
+
+    const attemptId = crypto.randomUUID();
+
+    const attemptResult = await client.query(
+      `
+      INSERT INTO task_attempts (
+        id,
+        task_id,
+        attempt_number,
+        status,
+        worker_id,
+        fencing_token,
+        lease_until,
+        last_heartbeat_at,
+        started_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        'RUNNING',
+        $4,
+        $5,
+        NOW() + ($6 * INTERVAL '1 second'),
+        NOW(),
+        NOW()
+      )
+      RETURNING
+        id,
+        attempt_number,
+        fencing_token,
+        worker_id;
+      `,
+      [
+        attemptId,
+        task.id,
+        task.attempt_count,
+        workerId,
+        fencingToken,
+        LEASE_SECONDS,
+      ],
+    );
+
+    await client.query("COMMIT");
 
     return {
-      transactionId: crypto.randomUUID(),
-      operationId,
-      success: true,
+      task,
+      attempt: attemptResult.rows[0],
     };
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    throw error;
+  } finally {
+    client.release();
   }
+}
 
-  async function markAttemptFailed(
-    taskId: string,
-    attemptNumber: number,
-    error: unknown,
-  ) {
-    const client = await pool.connect();
+async function heartbeat(
+  attemptId: string,
+  workerId: string,
+  fencingToken: number,
+): Promise<boolean> {
+  const result = await pool.query(
+    `
+    UPDATE task_attempts
+    SET
+      lease_until =
+        NOW() + ($4 * INTERVAL '1 second'),
+      last_heartbeat_at = NOW()
+    WHERE id = $1
+      AND worker_id = $2
+      AND fencing_token = $3
+      AND status = 'RUNNING'
+      AND lease_until > NOW()
+    `,
+    [attemptId, workerId, fencingToken, LEASE_SECONDS],
+  );
 
-    try {
-      await client.query("BEGIN");
+  return result.rowCount === 1;
+}
 
-      await client.query(
-        `
+async function completeAttempt(
+  taskId: string,
+  attemptId: string,
+  workerId: string,
+  fencingToken: number,
+  result: unknown,
+): Promise<boolean> {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const attemptResult = await client.query(
+      `
       UPDATE task_attempts
       SET
-        status = 'FAILED',
-        error = $1,
+        status = 'COMPLETED',
+        result = $1,
         completed_at = NOW()
-      WHERE task_id = $2
-        AND attempt_number = $3
-      `,
-        [
-          JSON.stringify({
-            message: error instanceof Error ? error.message : String(error),
-          }),
-          taskId,
-          attemptNumber,
-        ],
-      );
-
-      await client.query(
-        `
-      UPDATE tasks
-      SET
-        status = 'FAILED',
-        error = $1,
-        updated_at = NOW()
       WHERE id = $2
+        AND task_id = $3
+        AND worker_id = $4
+        AND fencing_token = $5
+        AND status = 'RUNNING'
+        AND lease_until > NOW()
+      RETURNING id;
       `,
-        [
-          JSON.stringify({
-            message: error instanceof Error ? error.message : String(error),
-          }),
-          taskId,
-        ],
-      );
+      [JSON.stringify(result), attemptId, taskId, workerId, fencingToken],
+    );
 
-      await client.query("COMMIT");
-    } catch (error) {
+    if (attemptResult.rowCount === 0) {
       await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
+
+      return false;
     }
-  }
 
-  async function markTaskCompleted(
-    taskId: string,
-    attemptNumber: number,
-    result: unknown,
-  ) {
-    const client = await pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
-      /*
-       * Mark attempt completed.
-       */
-      await client.query(
-        `
-      UPDATE task_attempts
-      SET
-        status = 'COMPLETED',
-        result = $1,
-        completed_at = NOW()
-      WHERE task_id = $2
-        AND attempt_number = $3
-      `,
-        [JSON.stringify(result), taskId, attemptNumber],
-      );
-
-      /*
-       * Mark logical task completed.
-       */
-      await client.query(
-        `
+    await client.query(
+      `
       UPDATE tasks
       SET
         status = 'COMPLETED',
         result = $1,
         updated_at = NOW()
       WHERE id = $2
+        AND status = 'RUNNING'
       `,
-        [JSON.stringify(result), taskId],
-      );
+      [JSON.stringify(result), taskId],
+    );
 
-      /*
-       * TODO:
-       *
-       * 1. Append TASK_COMPLETED event
-       * 2. Find dependent tasks
-       * 3. Determine which dependencies are now satisfied
-       * 4. Move newly-unblocked tasks to READY
-       * 5. Insert outbox messages
-       *
-       * We'll implement this next.
-       */
-
-      const sequenceResult = await client.query(
-        `
-      SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-      FROM workflow_events
-      WHERE workflow_id = (
-        SELECT workflow_id
-        FROM tasks
-        WHERE id = $1
-      )
-      `,
-        [taskId],
-      );
-
-      let sequence = Number(sequenceResult.rows[0].sequence);
-
-      const workflowResult = await client.query(
-        `
+    const workflowResult = await client.query(
+      `
       SELECT workflow_id
       FROM tasks
       WHERE id = $1
       `,
-        [taskId],
-      );
+      [taskId],
+    );
 
-      const workflowId = workflowResult.rows[0].workflow_id;
+    const workflowId = workflowResult.rows[0].workflow_id;
 
-      await client.query(
-        `
+    const sequenceResult = await client.query(
+      `
+      SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+      FROM workflow_events
+      WHERE workflow_id = $1
+      `,
+      [workflowId],
+    );
+
+    let sequence = Number(sequenceResult.rows[0].sequence);
+
+    await client.query(
+      `
       INSERT INTO workflow_events (
         id,
         workflow_id,
@@ -279,121 +358,114 @@ async function executeTask(taskId: string) {
       )
       VALUES ($1, $2, $3, $4, $5)
       `,
-        [
-          crypto.randomUUID(),
-          workflowId,
-          sequence++,
-          "TASK_COMPLETED",
-          JSON.stringify({
-            taskId,
-            result,
-          }),
-        ],
-      );
+      [
+        crypto.randomUUID(),
+        workflowId,
+        sequence++,
+        "TASK_COMPLETED",
+        JSON.stringify({
+          taskId,
+          attemptId,
+          fencingToken,
+          result,
+        }),
+      ],
+    );
 
-      const dependentTasks = await client.query(
-        `
-      SELECT task_id
-      FROM task_dependencies
-      WHERE depends_on_task_id = $1
-      `,
-        [taskId],
-      );
+    await client.query("COMMIT");
 
-      for (const row of dependentTasks.rows) {
-        const dependentTaskId = row.task_id;
+    return true;
+  } catch (error) {
+    await client.query("ROLLBACK");
 
-        const dependencyCheck = await client.query(
-          `
-        SELECT COUNT(*) AS remaining
-        FROM task_dependencies td
-        JOIN tasks dependency
-          ON dependency.id = td.depends_on_task_id
-        WHERE td.task_id = $1
-          AND dependency.status != 'COMPLETED'
-        `,
-          [dependentTaskId],
-        );
-        const remaining = Number(dependencyCheck.rows[0].remaining);
-
-        if (remaining !== 0) {
-          continue;
-        }
-
-        const readyResult = await client.query(
-          `
-        UPDATE tasks
-        SET
-          status = 'READY',
-          updated_at = NOW()
-        WHERE id = $1
-          AND status = 'PENDING'
-        RETURNING id, workflow_id, type, name
-        `,
-          [dependentTaskId],
-        );
-
-        if (readyResult.rowCount === 0) {
-          continue;
-        }
-
-        const readyTask = readyResult.rows[0];
-
-        // 8. Record TASK_READY
-        await client.query(
-          `
-        INSERT INTO workflow_events (
-          id,
-          workflow_id,
-          sequence,
-          event_type,
-          data
-        )
-        VALUES ($1, $2, $3, $4, $5)
-        `,
-          [
-            crypto.randomUUID(),
-            workflowId,
-            sequence++,
-            "TASK_READY",
-            JSON.stringify({
-              taskId: readyTask.id,
-            }),
-          ],
-        );
-
-        // 9. Create outbox message
-        await client.query(
-          `
-        INSERT INTO outbox (
-          id,
-          workflow_id,
-          task_id,
-          event_type,
-          payload
-        )
-        VALUES ($1, $2, $3, $4, $5)
-        `,
-          [
-            crypto.randomUUID(),
-            workflowId,
-            readyTask.id,
-            "TASK_READY",
-            JSON.stringify({
-              workflowId,
-              taskId: readyTask.id,
-              taskType: readyTask.type,
-            }),
-          ],
-        );
-      }
-
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
+    throw error;
+  } finally {
+    client.release();
   }
 }
+
+async function failAttempt(
+  taskId: string,
+  attemptId: string,
+  workerId: string,
+  fencingToken: number,
+  error: unknown,
+) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const errorData = {
+      message: error instanceof Error ? error.message : String(error),
+    };
+
+    const attemptResult = await client.query(
+      `
+      UPDATE task_attempts
+      SET
+        status = 'FAILED',
+        error = $1,
+        completed_at = NOW()
+      WHERE id = $2
+        AND task_id = $3
+        AND worker_id = $4
+        AND fencing_token = $5
+        AND status = 'RUNNING'
+      RETURNING id;
+      `,
+      [JSON.stringify(errorData), attemptId, taskId, workerId, fencingToken],
+    );
+
+    if (attemptResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+
+      return;
+    }
+    await client.query(
+      `
+      UPDATE tasks
+      SET
+        status = 'FAILED',
+        error = $1,
+        updated_at = NOW()
+      WHERE id = $2
+        AND status = 'RUNNING'
+      `,
+      [JSON.stringify(errorData), taskId],
+    );
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function executeActivity({
+  operationId,
+  type,
+}: {
+  operationId: string;
+  type: string;
+}) {
+  console.log(`[activity] executing ${type}`);
+
+  console.log(`[activity] idempotency key: ${operationId}`);
+
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+
+  return {
+    transactionId: crypto.randomUUID(),
+    operationId,
+    success: true,
+  };
+}
+
+startWorker().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
