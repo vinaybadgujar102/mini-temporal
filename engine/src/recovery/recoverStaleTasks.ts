@@ -5,28 +5,92 @@ export async function recoverStaleTasks() {
   const client = await pool.connect();
 
   try {
-    await client.query("BEGIN");
-
-    const result = await client.query(`
+    const candidates = await client.query(`
       SELECT
         t.id AS task_id,
-        t.workflow_id,
-        t.operation_id,
-        t.type,
-        a.id AS attempt_id,
-        a.attempt_number,
-        a.fencing_token
+        t.workflow_id
       FROM tasks t
+      JOIN workflows w ON w.id = t.workflow_id
       JOIN task_attempts a
         ON a.task_id = t.id
        AND a.attempt_number = t.attempt_count
-      WHERE t.status = 'RUNNING'
+      WHERE w.status = 'RUNNING'
+        AND t.status = 'RUNNING'
         AND a.status = 'RUNNING'
         AND a.lease_until < NOW()
-      FOR UPDATE OF t, a;
     `);
 
-    for (const task of result.rows) {
+    await client.query("BEGIN");
+
+    let recovered = 0;
+
+    for (const candidate of candidates.rows) {
+      // Lock order: workflow → task → attempt (same as cancel, claim, completion, failure).
+      const workflowResult = await client.query(
+        `
+        SELECT status
+        FROM workflows
+        WHERE id = $1
+        FOR UPDATE
+        `,
+        [candidate.workflow_id],
+      );
+
+      if (
+        workflowResult.rowCount !== 1 ||
+        workflowResult.rows[0].status !== "RUNNING"
+      ) {
+        continue;
+      }
+
+      const taskLock = await client.query(
+        `
+        SELECT
+          id AS task_id,
+          workflow_id,
+          operation_id,
+          type,
+          attempt_count
+        FROM tasks
+        WHERE id = $1
+          AND workflow_id = $2
+          AND status = 'RUNNING'
+        FOR UPDATE
+        `,
+        [candidate.task_id, candidate.workflow_id],
+      );
+
+      if (taskLock.rowCount !== 1) {
+        continue;
+      }
+
+      const lockedTask = taskLock.rows[0];
+
+      const attemptLock = await client.query(
+        `
+        SELECT
+          id AS attempt_id,
+          attempt_number,
+          fencing_token
+        FROM task_attempts
+        WHERE task_id = $1
+          AND attempt_number = $2
+          AND status = 'RUNNING'
+          AND lease_until < NOW()
+        FOR UPDATE
+        `,
+        [lockedTask.task_id, lockedTask.attempt_count],
+      );
+
+      if (attemptLock.rowCount !== 1) {
+        continue;
+      }
+
+      const task = {
+        ...lockedTask,
+        ...attemptLock.rows[0],
+      };
+
       console.log(`[recovery] recovering ${task.task_id}`);
 
       await client.query(
@@ -119,11 +183,13 @@ export async function recoverStaleTasks() {
           }),
         ],
       );
+
+      recovered++;
     }
 
     await client.query("COMMIT");
 
-    console.log(`[recovery] recovered ${result.rowCount} tasks`);
+    console.log(`[recovery] recovered ${recovered} tasks`);
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
@@ -137,7 +203,9 @@ async function main() {
   await pool.end();
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

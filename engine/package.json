@@ -8,6 +8,7 @@
     "infra": "docker compose up -d",
     "migrate": "psql \"$DATABASE_URL\" -f src/migrations/001_initial.sql && psql \"$DATABASE_URL\" -f src/migrations/002_add_fencing_token.sql && psql \"$DATABASE_URL\" -f src/migrations/003_add_payment_operations.sql && psql \"$DATABASE_URL\" -f src/migrations/004_add_next_retry_at.sql",
     "test:completion": "bun test src/workflow/workflowCompletion.integration.test.ts",
+    "test:failure": "bun test src/workflow/failurePropagation.integration.test.ts",
     "outbox": "bun src/outbox/index.ts",
     "worker": "bun src/worker/worker.ts",
     "start-workflow": "bun src/index.ts"

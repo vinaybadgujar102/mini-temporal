@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { PoolClient } from "pg";
 import { pool } from "../db/client";
 import { getTaskIdsByKey, startWorkflow } from "./startWorkflow";
@@ -45,10 +45,6 @@ async function taskStatus(taskId: string): Promise<string> {
 }
 
 describe.skipIf(!hasDb)("workflow completion (integration)", () => {
-  afterAll(async () => {
-    await pool.end();
-  });
-
   test("A then B: RUNNING until both done, one WORKFLOW_COMPLETED", async () => {
     const workflowId = await startWorkflow({
       type: "TEST_PARALLEL",

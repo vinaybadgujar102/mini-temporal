@@ -3,9 +3,8 @@ import { Kafka } from "kafkajs";
 import { pool } from "../db/client";
 import { chargePayment } from "../external/paymentService";
 import { handleAttemptFailure } from "../retry/handleAttemptFailure";
-import {
-  completeAttempt as completeTaskAttempt,
-} from "../workflow/taskCompletion";
+import { claimTask } from "./claimTask";
+import { completeAttempt as completeTaskAttempt } from "../workflow/taskCompletion";
 
 const kafka = new Kafka({
   clientId: "mini-temporal-worker",
@@ -30,21 +29,6 @@ type TaskMessage = {
     taskKey: string;
     taskType: string;
   };
-};
-
-type ClaimedTask = {
-  id: string;
-  workflow_id: string;
-  type: string;
-  operation_id: string;
-  attempt_count: number;
-};
-
-type ClaimedAttempt = {
-  id: string;
-  attempt_number: number;
-  fencing_token: number;
-  worker_id: string;
 };
 
 export async function startWorker() {
@@ -158,105 +142,6 @@ async function executeTask(taskId: string) {
     );
   } finally {
     clearInterval(heartbeatTimer);
-  }
-}
-
-async function claimTask(
-  taskId: string,
-  workerId: string,
-): Promise<{
-  task: ClaimedTask;
-  attempt: ClaimedAttempt;
-} | null> {
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const taskResult = await client.query(
-      `
-      UPDATE tasks
-      SET
-        status = 'RUNNING',
-        attempt_count = attempt_count + 1,
-        updated_at = NOW()
-      WHERE id = $1
-        AND status = 'READY'
-        AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-      RETURNING
-        id,
-        workflow_id,
-        type,
-        operation_id,
-        attempt_count;
-      `,
-      [taskId],
-    );
-
-    if (taskResult.rowCount === 0) {
-      await client.query("ROLLBACK");
-
-      return null;
-    }
-
-    const task = taskResult.rows[0] as ClaimedTask;
-
-    const fencingToken = task.attempt_count;
-
-    const attemptId = crypto.randomUUID();
-
-    const attemptResult = await client.query(
-      `
-      INSERT INTO task_attempts (
-        id,
-        task_id,
-        attempt_number,
-        status,
-        worker_id,
-        fencing_token,
-        lease_until,
-        last_heartbeat_at,
-        started_at
-      )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        'RUNNING',
-        $4,
-        $5,
-        NOW() + ($6 * INTERVAL '1 second'),
-        NOW(),
-        NOW()
-      )
-      RETURNING
-        id,
-        attempt_number,
-        fencing_token,
-        worker_id;
-      `,
-      [
-        attemptId,
-        task.id,
-        task.attempt_count,
-        workerId,
-        fencingToken,
-        LEASE_SECONDS,
-      ],
-    );
-
-    await client.query("COMMIT");
-
-    return {
-      task,
-      attempt: attemptResult.rows[0],
-    };
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    throw error;
-  } finally {
-    client.release();
   }
 }
 

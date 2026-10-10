@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { Pool, PoolClient } from "pg";
+import { handleAttemptFailure } from "../retry/handleAttemptFailure";
 import { updateWorkflowStatus } from "./updateWorkflowStatus";
 
 function taskKeyFrom(workflowId: string, operationId: string) {
@@ -15,6 +16,22 @@ export async function scheduleUnblockedDependents(
   completedTaskId: string,
   sequenceStart: number,
 ) {
+  const workflowResult = await client.query(
+    `
+  SELECT status
+  FROM workflows
+  WHERE id = $1
+  `,
+    [workflowId],
+  );
+
+  if (
+    workflowResult.rowCount !== 1 ||
+    workflowResult.rows[0].status !== "RUNNING"
+  ) {
+    return;
+  }
+
   let sequence = sequenceStart;
 
   const dependents = await client.query(
@@ -110,51 +127,6 @@ export async function scheduleUnblockedDependents(
       ],
     );
   }
-
-  const open = await client.query(
-    `
-    SELECT 1
-    FROM tasks
-    WHERE workflow_id = $1
-      AND status <> 'COMPLETED'
-    LIMIT 1
-    `,
-    [workflowId],
-  );
-
-  if ((open.rowCount ?? 0) > 0) return;
-
-  await client.query(
-    `
-    UPDATE workflows
-    SET
-      status = 'COMPLETED',
-      updated_at = NOW()
-    WHERE id = $1
-      AND status = 'RUNNING'
-    `,
-    [workflowId],
-  );
-
-  await client.query(
-    `
-    INSERT INTO workflow_events (
-      id,
-      workflow_id,
-      sequence,
-      event_type,
-      data
-    )
-    VALUES ($1, $2, $3, $4, $5)
-    `,
-    [
-      crypto.randomUUID(),
-      workflowId,
-      sequence++,
-      "WORKFLOW_COMPLETED",
-      JSON.stringify({ workflowId }),
-    ],
-  );
 }
 
 export async function completeAttempt(
@@ -169,6 +141,57 @@ export async function completeAttempt(
 
   try {
     await client.query("BEGIN");
+
+    const taskRow = await client.query(
+      `
+      SELECT workflow_id
+      FROM tasks
+      WHERE id = $1
+      `,
+      [taskId],
+    );
+
+    if (taskRow.rowCount === 0) {
+      throw new Error(`Task not found: ${taskId}`);
+    }
+
+    const workflowId = taskRow.rows[0].workflow_id as string;
+
+    // Lock order: workflow → task → attempt (matches cancelWorkflow and claimTask).
+    const workflowResult = await client.query(
+      `
+      SELECT status
+      FROM workflows
+      WHERE id = $1
+      FOR UPDATE
+      `,
+      [workflowId],
+    );
+
+    if (
+      workflowResult.rowCount !== 1 ||
+      workflowResult.rows[0].status !== "RUNNING"
+    ) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+
+    const taskLock = await client.query(
+      `
+      SELECT id
+      FROM tasks
+      WHERE id = $1
+        AND workflow_id = $2
+        AND status = 'RUNNING'
+      FOR UPDATE
+      `,
+      [taskId, workflowId],
+    );
+
+    if (taskLock.rowCount !== 1) {
+      await client.query("ROLLBACK");
+      return false;
+    }
 
     const attemptResult = await client.query(
       `
@@ -205,31 +228,6 @@ export async function completeAttempt(
         AND status = 'RUNNING'
       `,
       [JSON.stringify(result), taskId],
-    );
-
-    const workflowResult = await client.query(
-      `
-      SELECT workflow_id
-      FROM tasks
-      WHERE id = $1
-      `,
-      [taskId],
-    );
-
-    if (workflowResult.rowCount === 0) {
-      throw new Error(`Task not found: ${taskId}`);
-    }
-
-    const workflowId = workflowResult.rows[0].workflow_id;
-
-    await client.query(
-      `
-      SELECT id
-      FROM workflows
-      WHERE id = $1
-      FOR UPDATE
-      `,
-      [workflowId],
     );
 
     const sequenceResult = await client.query(
@@ -279,6 +277,32 @@ export async function completeAttempt(
     await client.query("ROLLBACK");
 
     throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function failAttemptForTest(
+  pool: Pool,
+  taskId: string,
+  attemptId: string,
+  workerId: string,
+  fencingToken: number,
+  workflowId: string,
+  error: { code?: string; message: string },
+) {
+  const client = await pool.connect();
+
+  try {
+    return await handleAttemptFailure({
+      client,
+      taskId,
+      attemptId,
+      workflowId,
+      workerId,
+      fencingToken,
+      error,
+    });
   } finally {
     client.release();
   }
@@ -350,14 +374,7 @@ export async function claimTaskForTest(
         NOW()
       )
       `,
-      [
-        attemptId,
-        row.id,
-        fencingToken,
-        workerId,
-        fencingToken,
-        leaseSeconds,
-      ],
+      [attemptId, row.id, fencingToken, workerId, fencingToken, leaseSeconds],
     );
 
     await client.query("COMMIT");
