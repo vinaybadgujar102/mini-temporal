@@ -1,6 +1,6 @@
 # engine
 
-Core mini-temporal workflow engine — Postgres state, Kafka dispatch, outbox relay, and worker.
+Core mini-temporal workflow engine: Postgres state, Kafka dispatch, outbox relay, leased workers, and stale-task recovery.
 
 Full project documentation lives in the [root README](../README.md).
 
@@ -8,8 +8,24 @@ Full project documentation lives in the [root README](../README.md).
 
 ```bash
 bun install
-bun run demo          # browser demo — no Postgres/Kafka needed
-bun src/index.ts      # start example workflow (requires DB + relay + worker)
+bun run demo              # crash/recover lab in the browser, no Postgres/Kafka
+bun run infra             # docker compose: Postgres + Kafka
+bun run migrate
+bun run outbox            # terminal 1
+bun run worker            # terminal 2
+bun run start-workflow    # terminal 3
 ```
 
-See [How to Run](../README.md#how-to-run) for the full stack setup.
+Crash a worker after the activity succeeds:
+
+```bash
+CRASH_AFTER_ACTIVITY=true bun run worker
+```
+
+Then wait 30s for the lease and run:
+
+```bash
+bun src/recovery/recoverStaleTasks.ts
+```
+
+See [How to run](../README.md#how-to-run) for the rest.

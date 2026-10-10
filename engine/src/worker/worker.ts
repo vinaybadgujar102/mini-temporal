@@ -1,8 +1,11 @@
 import crypto from "node:crypto";
 import { Kafka } from "kafkajs";
-import type { PoolClient } from "pg";
 import { pool } from "../db/client";
 import { chargePayment } from "../external/paymentService";
+import { handleAttemptFailure } from "../retry/handleAttemptFailure";
+import {
+  completeAttempt as completeTaskAttempt,
+} from "../workflow/taskCompletion";
 
 const kafka = new Kafka({
   clientId: "mini-temporal-worker",
@@ -132,7 +135,8 @@ async function executeTask(taskId: string) {
       process.exit(1);
     }
 
-    const completed = await completeAttempt(
+    const completed = await completeTaskAttempt(
+      pool,
       task.id,
       attempt.id,
       workerId,
@@ -149,6 +153,7 @@ async function executeTask(taskId: string) {
       attempt.id,
       workerId,
       attempt.fencing_token,
+      task.workflow_id,
       error,
     );
   } finally {
@@ -177,6 +182,7 @@ async function claimTask(
         updated_at = NOW()
       WHERE id = $1
         AND status = 'READY'
+        AND (next_retry_at IS NULL OR next_retry_at <= NOW())
       RETURNING
         id,
         workflow_id,
@@ -278,172 +284,36 @@ async function heartbeat(
   return result.rowCount === 1;
 }
 
-async function completeAttempt(
-  taskId: string,
-  attemptId: string,
-  workerId: string,
-  fencingToken: number,
-  result: unknown,
-): Promise<boolean> {
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const attemptResult = await client.query(
-      `
-      UPDATE task_attempts
-      SET
-        status = 'COMPLETED',
-        result = $1,
-        completed_at = NOW()
-      WHERE id = $2
-        AND task_id = $3
-        AND worker_id = $4
-        AND fencing_token = $5
-        AND status = 'RUNNING'
-        AND lease_until > NOW()
-      RETURNING id;
-      `,
-      [JSON.stringify(result), attemptId, taskId, workerId, fencingToken],
-    );
-
-    if (attemptResult.rowCount === 0) {
-      await client.query("ROLLBACK");
-
-      return false;
-    }
-
-    await client.query(
-      `
-      UPDATE tasks
-      SET
-        status = 'COMPLETED',
-        result = $1,
-        updated_at = NOW()
-      WHERE id = $2
-        AND status = 'RUNNING'
-      `,
-      [JSON.stringify(result), taskId],
-    );
-
-    const workflowResult = await client.query(
-      `
-      SELECT workflow_id
-      FROM tasks
-      WHERE id = $1
-      `,
-      [taskId],
-    );
-
-    const workflowId = workflowResult.rows[0].workflow_id;
-
-    const sequenceResult = await client.query(
-      `
-      SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-      FROM workflow_events
-      WHERE workflow_id = $1
-      `,
-      [workflowId],
-    );
-
-    let sequence = Number(sequenceResult.rows[0].sequence);
-
-    await client.query(
-      `
-      INSERT INTO workflow_events (
-        id,
-        workflow_id,
-        sequence,
-        event_type,
-        data
-      )
-      VALUES ($1, $2, $3, $4, $5)
-      `,
-      [
-        crypto.randomUUID(),
-        workflowId,
-        sequence++,
-        "TASK_COMPLETED",
-        JSON.stringify({
-          taskId,
-          attemptId,
-          fencingToken,
-          result,
-        }),
-      ],
-    );
-
-    await scheduleUnblockedDependents(client, workflowId, taskId, sequence);
-
-    await client.query("COMMIT");
-
-    return true;
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 async function failAttempt(
   taskId: string,
   attemptId: string,
   workerId: string,
   fencingToken: number,
+  workflowId: string,
   error: unknown,
 ) {
   const client = await pool.connect();
 
   try {
-    await client.query("BEGIN");
+    const errorPayload =
+      error instanceof Error
+        ? {
+            message: error.message,
+            ...("code" in error && typeof error.code === "string"
+              ? { code: error.code }
+              : {}),
+          }
+        : { message: String(error) };
 
-    const errorData = {
-      message: error instanceof Error ? error.message : String(error),
-    };
-
-    const attemptResult = await client.query(
-      `
-      UPDATE task_attempts
-      SET
-        status = 'FAILED',
-        error = $1,
-        completed_at = NOW()
-      WHERE id = $2
-        AND task_id = $3
-        AND worker_id = $4
-        AND fencing_token = $5
-        AND status = 'RUNNING'
-      RETURNING id;
-      `,
-      [JSON.stringify(errorData), attemptId, taskId, workerId, fencingToken],
-    );
-
-    if (attemptResult.rowCount === 0) {
-      await client.query("ROLLBACK");
-
-      return;
-    }
-    await client.query(
-      `
-      UPDATE tasks
-      SET
-        status = 'FAILED',
-        error = $1,
-        updated_at = NOW()
-      WHERE id = $2
-        AND status = 'RUNNING'
-      `,
-      [JSON.stringify(errorData), taskId],
-    );
-
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-
-    throw error;
+    await handleAttemptFailure({
+      client,
+      taskId,
+      attemptId,
+      workflowId,
+      workerId,
+      fencingToken,
+      error: errorPayload,
+    });
   } finally {
     client.release();
   }
@@ -466,161 +336,6 @@ async function executeActivity({
     operationId,
     success: true,
   };
-}
-
-function taskKeyFrom(workflowId: string, operationId: string) {
-  const prefix = `${workflowId}:`;
-  return operationId.startsWith(prefix)
-    ? operationId.slice(prefix.length)
-    : operationId;
-}
-
-async function scheduleUnblockedDependents(
-  client: PoolClient,
-  workflowId: string,
-  completedTaskId: string,
-  sequenceStart: number,
-) {
-  let sequence = sequenceStart;
-
-  const dependents = await client.query(
-    `
-    SELECT
-      child.id,
-      child.type,
-      child.operation_id
-    FROM task_dependencies d
-    JOIN tasks child ON child.id = d.task_id
-    WHERE d.depends_on_task_id = $1
-      AND child.status = 'PENDING'
-    `,
-    [completedTaskId],
-  );
-
-  for (const child of dependents.rows) {
-    const blocked = await client.query(
-      `
-      SELECT 1
-      FROM task_dependencies d
-      JOIN tasks dep ON dep.id = d.depends_on_task_id
-      WHERE d.task_id = $1
-        AND dep.status <> 'COMPLETED'
-      LIMIT 1
-      `,
-      [child.id],
-    );
-
-    if ((blocked.rowCount ?? 0) > 0) continue;
-
-    await client.query(
-      `
-      UPDATE tasks
-      SET
-        status = 'READY',
-        updated_at = NOW()
-      WHERE id = $1
-        AND status = 'PENDING'
-      `,
-      [child.id],
-    );
-
-    const taskKey = taskKeyFrom(workflowId, String(child.operation_id));
-
-    await client.query(
-      `
-      INSERT INTO workflow_events (
-        id,
-        workflow_id,
-        sequence,
-        event_type,
-        data
-      )
-      VALUES ($1, $2, $3, $4, $5)
-      `,
-      [
-        crypto.randomUUID(),
-        workflowId,
-        sequence++,
-        "TASK_READY",
-        JSON.stringify({
-          taskId: child.id,
-          taskKey,
-          taskType: child.type,
-        }),
-      ],
-    );
-
-    await client.query(
-      `
-      INSERT INTO outbox (
-        id,
-        workflow_id,
-        task_id,
-        event_type,
-        payload
-      )
-      VALUES ($1, $2, $3, $4, $5)
-      `,
-      [
-        crypto.randomUUID(),
-        workflowId,
-        child.id,
-        "TASK_READY",
-        JSON.stringify({
-          workflowId,
-          taskId: child.id,
-          taskKey,
-          taskType: child.type,
-          operationId: child.operation_id,
-        }),
-      ],
-    );
-  }
-
-  const open = await client.query(
-    `
-    SELECT 1
-    FROM tasks
-    WHERE workflow_id = $1
-      AND status <> 'COMPLETED'
-    LIMIT 1
-    `,
-    [workflowId],
-  );
-
-  if ((open.rowCount ?? 0) > 0) return;
-
-  await client.query(
-    `
-    UPDATE workflows
-    SET
-      status = 'COMPLETED',
-      updated_at = NOW()
-    WHERE id = $1
-      AND status = 'RUNNING'
-    `,
-    [workflowId],
-  );
-
-  await client.query(
-    `
-    INSERT INTO workflow_events (
-      id,
-      workflow_id,
-      sequence,
-      event_type,
-      data
-    )
-    VALUES ($1, $2, $3, $4, $5)
-    `,
-    [
-      crypto.randomUUID(),
-      workflowId,
-      sequence++,
-      "WORKFLOW_COMPLETED",
-      JSON.stringify({ workflowId }),
-    ],
-  );
 }
 
 startWorker().catch((error) => {

@@ -1,0 +1,4 @@
+ALTER TABLE tasks
+ADD COLUMN next_retry_at TIMESTAMPTZ;
+
+
