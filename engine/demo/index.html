@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>mini-temporal — crash and recover lab</title>
+    <title>mini-temporal — crash, retry, and saga lab</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -18,26 +18,36 @@
         <div class="masthead-text">
           <h1>mini-temporal</h1>
           <p class="lede">
-            Crash a worker. The task stays running. Wait out the lease. Recover
-            it yourself. Two consumers then race one claim — only one wins.
+            Crash and recover with fencing. Fail with retry backoff. Cancel a
+            run. Or break confirmation after charge and watch the saga refund.
           </p>
         </div>
         <div class="controls">
           <label class="preset-picker" id="preset-wrap" for="preset" hidden>
             <span>Workflow</span>
             <select id="preset" aria-label="Choose workflow">
+              <option value="checkout">Process order</option>
               <option value="onboarding">User onboarding</option>
               <option value="order">Order fulfillment</option>
             </select>
           </label>
           <button type="button" id="start-lab-btn" class="btn-primary">
-            Start lab
+            Crash lab
+          </button>
+          <button type="button" id="start-saga-btn" class="btn-ghost">
+            Saga lab
           </button>
           <button type="button" id="start-free-btn" class="btn-ghost" hidden>
             Start workflow
           </button>
           <button type="button" id="crash-btn" class="btn-crash" disabled>
             Crash worker
+          </button>
+          <button type="button" id="fail-btn" class="btn-ghost" disabled>
+            Fail task
+          </button>
+          <button type="button" id="cancel-btn" class="btn-ghost" disabled>
+            Cancel
           </button>
           <button type="button" id="recover-btn" class="btn-ghost" disabled>
             Recover stale
@@ -113,8 +123,8 @@
               <g id="dag-nodes"></g>
             </svg>
             <p class="dag-empty" id="dag-empty">
-              Start the lab to run a three-step signup. You crash the first
-              worker, wait out the lease, then recover.
+              Crash lab: lease and fencing. Saga lab: charge, fail confirmation,
+              refund. Free play: cancel, fail, or crash any node.
             </p>
           </div>
           <ul class="legend" aria-label="Task status legend">
@@ -123,6 +133,7 @@
             <li><span class="dot running"></span> Running</li>
             <li><span class="dot completed"></span> Done</li>
             <li><span class="dot failed"></span> Failed</li>
+            <li><span class="dot cancelled"></span> Cancelled</li>
           </ul>
 
           <div class="subpanel">
@@ -163,7 +174,7 @@
             <div class="panel-head">
               <h2>Payment operations</h2>
               <p class="panel-note">
-                Same charge key returns the same transaction.
+                Same charge key returns the same transaction. Refund undoes it.
               </p>
             </div>
             <div class="table-wrap">
@@ -173,6 +184,7 @@
                     <th>Key</th>
                     <th>Txn</th>
                     <th>Amount</th>
+                    <th>Status</th>
                     <th>Hit</th>
                   </tr>
                 </thead>
@@ -180,6 +192,27 @@
               </table>
             </div>
             <p class="log-empty" id="pay-empty">No charges yet.</p>
+          </section>
+
+          <section class="log-panel" id="comp-panel" aria-label="Compensation operations" hidden>
+            <div class="panel-head">
+              <h2>Compensations</h2>
+              <p class="panel-note">Saga undoes completed forward work.</p>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="comp-table" hidden>
+                <thead>
+                  <tr>
+                    <th>Task</th>
+                    <th>Type</th>
+                    <th>#</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="comp-rows"></tbody>
+              </table>
+            </div>
+            <p class="log-empty" id="comp-empty">No compensations yet.</p>
           </section>
 
           <details class="engine-detail" id="engine-detail" hidden>
@@ -191,9 +224,9 @@
 
       <footer class="footnote">
         <p>
-          Recover is disabled until the lease hits 0 on purpose. That wait is
-          the lesson. After the lab, crash any running node, or switch to order
-          fulfillment.
+          Crash lab teaches leases and fencing. Saga lab fails confirmation after
+          a successful charge, then refunds. Free play also has cancel and
+          permanent fail.
         </p>
       </footer>
     </div>

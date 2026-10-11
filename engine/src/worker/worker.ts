@@ -5,6 +5,7 @@ import { chargePayment } from "../external/paymentService";
 import { handleAttemptFailure } from "../retry/handleAttemptFailure";
 import { claimTask } from "./claimTask";
 import { completeAttempt as completeTaskAttempt } from "../workflow/taskCompletion";
+import { logger } from "../observability/logger";
 
 const kafka = new Kafka({
   clientId: "mini-temporal-worker",
@@ -47,7 +48,15 @@ export async function startWorker() {
 
       const taskMessage: TaskMessage = JSON.parse(message.value.toString());
 
-      console.log(`[worker] received task ${taskMessage.taskId}`);
+      logger.info(
+        {
+          event: "worker.task.received",
+          workflowId: taskMessage.workflowId,
+          taskId: taskMessage.taskId,
+          outboxId: taskMessage.outboxId,
+        },
+        "Task received from Kafka",
+      );
 
       await executeTask(taskMessage.taskId);
     },
@@ -73,17 +82,32 @@ async function executeTask(taskId: string) {
   const claimed = await claimTask(taskId, workerId);
 
   if (!claimed) {
-    console.log(`[worker] task ${taskId} was already claimed`);
+    logger.info(
+      {
+        event: "worker.task.claim_skipped",
+        taskId,
+        reason: "not_claimable",
+      },
+      "Task was not claimed",
+    );
 
     return;
   }
 
   const { task, attempt } = claimed;
 
-  console.log(
-    `[worker] claimed task=${task.id} ` +
-      `attempt=${attempt.attempt_number} ` +
-      `token=${attempt.fencing_token}`,
+  const workflowId = task.workflow_id;
+
+  logger.info(
+    {
+      event: "worker.task.claimed",
+      workflowId,
+      taskId,
+      attemptId: attempt.id,
+      attempt: attempt.attempt_number,
+      fencingToken: attempt.fencing_token,
+    },
+    "Task claimed",
   );
 
   // Heartbeat every 10 seconds.
@@ -96,25 +120,64 @@ async function executeTask(taskId: string) {
       );
 
       if (!alive) {
-        console.log(`[worker] lost ownership of attempt ${attempt.id}`);
+        logger.warn(
+          {
+            event: "worker.heartbeat.ownership_lost",
+            workflowId,
+            taskId,
+            attemptId: attempt.id,
+            fencingToken: attempt.fencing_token,
+          },
+          "Worker no longer owns the task attempt",
+        );
 
         clearInterval(heartbeatTimer);
       }
     } catch (error) {
-      console.error("[worker] heartbeat failed", error);
+      logger.error(
+        {
+          event: "worker.heartbeat.failed",
+          workflowId,
+          taskId,
+          attemptId: attempt.id,
+          err: error,
+        },
+        "Heartbeat update failed",
+      );
     }
   }, 10_000);
 
   try {
+    const activityStartedAt = performance.now();
+
     const result = await executeActivity({
       operationId: task.operation_id,
       type: task.type,
     });
 
-    console.log(`[worker] activity succeeded for ${task.id}`);
+    const durationMs = Math.round(performance.now() - activityStartedAt);
+
+    logger.info(
+      {
+        event: "worker.activity.succeeded",
+        workflowId,
+        taskId,
+        attemptId: attempt.id,
+        durationMs,
+      },
+      "Activity execution succeeded",
+    );
 
     if (process.env.CRASH_AFTER_ACTIVITY === "true") {
-      console.log("[worker] 💥 crashing after activity");
+      logger.fatal(
+        {
+          event: "worker.crash_injection.triggered",
+          workflowId,
+          taskId,
+          attemptId: attempt.id,
+        },
+        "Crash injection after activity execution",
+      );
 
       process.exit(1);
     }
@@ -129,7 +192,27 @@ async function executeTask(taskId: string) {
     );
 
     if (!completed) {
-      console.log(`[worker] stale result rejected for ${task.id}`);
+      logger.warn(
+        {
+          event: "worker.task.stale_result_rejected",
+          workflowId,
+          taskId,
+          attemptId: attempt.id,
+          fencingToken: attempt.fencing_token,
+        },
+        "Stale task result rejected",
+      );
+    } else {
+      logger.info(
+        {
+          event: "worker.task.completed",
+          workflowId,
+          taskId,
+          attemptId: attempt.id,
+          fencingToken: attempt.fencing_token,
+        },
+        "Task completed durably",
+      );
     }
   } catch (error) {
     await failAttempt(
@@ -137,7 +220,7 @@ async function executeTask(taskId: string) {
       attempt.id,
       workerId,
       attempt.fencing_token,
-      task.workflow_id,
+      workflowId,
       error,
     );
   } finally {
@@ -224,6 +307,13 @@ async function executeActivity({
 }
 
 startWorker().catch((error) => {
-  console.error(error);
+  logger.fatal(
+    {
+      event: "worker.startup.failed",
+      err: error,
+    },
+    "Worker failed to start",
+  );
+
   process.exit(1);
 });

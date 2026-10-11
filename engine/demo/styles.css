@@ -12,6 +12,8 @@
   --running: #f97066;
   --completed: #2dd4bf;
   --failed: #e5484d;
+  --cancelled: #8a8494;
+  --compensating: #e8a87c;
   --timed-out: #e8a87c;
   --recovered: #6ea8d9;
 
@@ -431,6 +433,12 @@ button:focus-visible {
   fill: #1a1011;
 }
 
+.dag-node.cancelled rect {
+  stroke: var(--cancelled);
+  fill: #16161c;
+  opacity: 0.85;
+}
+
 .dag-node-label {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -521,6 +529,9 @@ button:focus-visible {
 }
 .dot.failed {
   background: var(--failed);
+}
+.dot.cancelled {
+  background: var(--cancelled);
 }
 
 .lease-bar {
@@ -772,6 +783,29 @@ button:focus-visible {
 
 #wf-status[data-status="FAILED"] {
   color: var(--failed);
+}
+
+#wf-status[data-status="CANCELLED"] {
+  color: var(--cancelled);
+}
+
+#wf-status[data-status="COMPENSATING"] {
+  color: var(--compensating);
+}
+
+.status-chip.cancelled {
+  color: var(--cancelled);
+}
+
+.status-chip.refunded,
+.status-chip.succeeded {
+  color: var(--completed);
+}
+
+.status-chip.compensating,
+.status-chip.pending,
+.status-chip.ready {
+  color: var(--ready);
 }
 
 @media (prefers-reduced-motion: reduce) {

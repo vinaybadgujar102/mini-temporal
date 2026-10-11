@@ -1,0 +1,21 @@
+
+groups:
+  - name: mini-temporal-outbox
+    rules:
+      - alert: OutboxActionableBacklogGrowing
+        expr: outbox_oldest_actionable_pending_age_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox actionable backlog is aging"
+          description: "The oldest actionable outbox message is over 60 seconds old for at least 2 minutes."
+
+      - alert: OutboxMetricsTargetDown
+        expr: up{job="mini-temporal-outbox"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Outbox metrics endpoint is unavailable"
+          description: "Prometheus has failed to scrape the outbox metrics endpoint for at least 1 minute."

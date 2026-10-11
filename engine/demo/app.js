@@ -1,9 +1,30 @@
 /**
  * In-browser simulation of mini-temporal.
- * Manual crash, manual recoverStaleTasks, dual consumers racing one claim.
+ * Crash/recover, dual claim race, retry backoff, cancel, saga compensation.
  */
 
 export const PRESETS = {
+  checkout: {
+    type: "ORDER_PROCESSING",
+    name: "Process Order",
+    version: 1,
+    viewBox: "0 0 520 280",
+    tasks: [
+      { id: "charge", name: "Charge Payment", type: "CHARGE_PAYMENT" },
+      { id: "reserve", name: "Reserve Inventory", type: "RESERVE_INVENTORY" },
+      {
+        id: "email",
+        name: "Send Confirmation",
+        type: "SEND_EMAIL",
+        dependsOn: ["charge", "reserve"],
+      },
+    ],
+    layout: {
+      charge: { x: 40, y: 30 },
+      reserve: { x: 360, y: 30 },
+      email: { x: 200, y: 160 },
+    },
+  },
   order: {
     type: "ORDER_FULFILLMENT",
     name: "Fulfill Order",
@@ -114,6 +135,32 @@ const HEARTBEAT_MS = 1200;
 const PAYMENT_AMOUNT = 4999;
 const WAIT_SLICE = 80;
 
+/** Demo-scaled copy of engine/src/retry/retryPolicy.ts (no jitter). */
+export const defaultRetryPolicy = {
+  maxAttempts: 5,
+  initialDelayMs: 400,
+  maxDelayMs: 2_000,
+  jitterFactor: 0,
+};
+
+const COMPENSATION_REGISTRY = {
+  CHARGE_PAYMENT: { type: "REFUND_PAYMENT" },
+};
+
+export function isRetryable(error) {
+  const code = error?.code ?? "";
+  return ["503", "429", "ECONNRESET", "ETIMEDOUT"].includes(code);
+}
+
+export function calculateRetryDelay(failedAttempt, policy = defaultRetryPolicy) {
+  const exponentialDelay = Math.min(
+    policy.initialDelayMs * 2 ** (failedAttempt - 1),
+    policy.maxDelayMs,
+  );
+  const jitter = 1 + (Math.random() * 2 - 1) * policy.jitterFactor;
+  return Math.round(exponentialDelay * jitter);
+}
+
 function uuid() {
   return crypto.randomUUID();
 }
@@ -132,7 +179,7 @@ function shortId(id) {
 export class MiniTemporalEngine {
   /**
    * @param {Preset} definition
-   * @param {{ dualClaim?: boolean, leaseMs?: number, heartbeatMs?: number, outboxMs?: number, activityMs?: number, gateCrashKey?: string | null, unlockDualOnRecover?: boolean, runKind?: "lab" | "free" }} [opts]
+   * @param {{ dualClaim?: boolean, leaseMs?: number, heartbeatMs?: number, outboxMs?: number, activityMs?: number, gateCrashKey?: string | null, unlockDualOnRecover?: boolean, runKind?: "lab" | "free" | "saga", retryPolicy?: typeof defaultRetryPolicy }} [opts]
    */
   constructor(definition, opts = {}) {
     this.definition = definition;
@@ -145,6 +192,7 @@ export class MiniTemporalEngine {
     this.heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
     this.outboxMs = opts.outboxMs ?? OUTBOX_MS;
     this.activityMs = opts.activityMs ?? ACTIVITY_MS;
+    this.retryPolicy = opts.retryPolicy ?? defaultRetryPolicy;
     this.workflowId = uuid();
     this.workflowStatus = "RUNNING";
     this.sequence = 0;
@@ -165,9 +213,13 @@ export class MiniTemporalEngine {
     /** @type {object[]} */
     this.payments = [];
     /** @type {object[]} */
+    this.compensations = [];
+    /** @type {object[]} */
     this.zombies = [];
     /** @type {Set<string>} */
     this.crashRequested = new Set();
+    /** @type {Map<string, { code?: string, message: string }>} */
+    this.failRequested = new Map();
     /** @type {Map<string, ReturnType<typeof setInterval>>} */
     this.heartbeatTimers = new Map();
     /** @type {Record<string, string>} */
@@ -209,6 +261,7 @@ export class MiniTemporalEngine {
       operationId: `${this.workflowId}:${taskDef.id}`,
       status,
       attemptCount: 0,
+      nextRetryAt: null,
       result: null,
       error: null,
     };
@@ -273,6 +326,18 @@ export class MiniTemporalEngine {
       const msg = this.outbox.shift();
       await sleep(this.outboxMs);
       if (!this.running) return;
+
+      // Match outbox/publisher.ts: drop TASK_READY when workflow not RUNNING.
+      if (this.workflowStatus !== "RUNNING") {
+        this.appendEvent("OUTBOX_DISCARDED", {
+          outboxId: msg.id,
+          taskKey: msg.taskKey,
+          reason: "workflow_not_running",
+          workflowStatus: this.workflowStatus,
+        });
+        continue;
+      }
+
       this.appendEvent("OUTBOX_PUBLISHED", {
         outboxId: msg.id,
         taskKey: msg.taskKey,
@@ -417,19 +482,31 @@ export class MiniTemporalEngine {
   /** @param {string} taskKey @param {string} [consumerId] */
   claimTask(taskKey, consumerId) {
     const task = this.tasks.get(taskKey);
-    if (!task || task.status !== "READY") {
+    const notClaimable =
+      this.workflowStatus !== "RUNNING" ||
+      !task ||
+      task.status !== "READY" ||
+      (task.nextRetryAt != null && task.nextRetryAt > this.now());
+
+    if (notClaimable) {
       if (consumerId) {
         this.setConsumer(consumerId, `skip ${taskKey}`);
         this.appendEvent("CLAIM_SKIPPED", {
           taskKey,
           consumerId,
-          reason: "NOT_READY",
+          reason:
+            this.workflowStatus !== "RUNNING"
+              ? "WORKFLOW_NOT_RUNNING"
+              : task?.nextRetryAt != null && task.nextRetryAt > this.now()
+                ? "RETRY_NOT_DUE"
+                : "NOT_READY",
         });
       }
       return null;
     }
 
     task.status = "RUNNING";
+    task.nextRetryAt = null;
     task.attemptCount += 1;
 
     const fencingToken = task.attemptCount;
@@ -498,7 +575,7 @@ export class MiniTemporalEngine {
   chargePayment(operationId, amount) {
     const existing = this.paymentStore.get(operationId);
     if (existing) {
-      this.payments.push({ ...existing, duplicate: true });
+      this.payments.push({ ...existing, duplicate: true, refund: false });
       return existing;
     }
     const payment = {
@@ -506,22 +583,355 @@ export class MiniTemporalEngine {
       transactionId: uuid(),
       amount,
       status: "SUCCEEDED",
+      refundIdempotencyKey: null,
     };
     this.paymentStore.set(operationId, payment);
-    this.payments.push({ ...payment, duplicate: false });
+    this.payments.push({ ...payment, duplicate: false, refund: false });
     return payment;
+  }
+
+  refundPayment(operationId, compensationIdempotencyKey) {
+    const payment = this.paymentStore.get(operationId);
+    if (!payment) throw new Error(`Payment not found: ${operationId}`);
+
+    if (
+      payment.refundIdempotencyKey != null &&
+      payment.refundIdempotencyKey !== compensationIdempotencyKey
+    ) {
+      throw new Error(`Payment ${operationId} already has a different refund key`);
+    }
+
+    if (payment.status === "REFUNDED") {
+      this.payments.push({ ...payment, duplicate: true, refund: true });
+      return {
+        transactionId: payment.transactionId,
+        operationId: payment.operationId,
+        amount: payment.amount,
+        status: "REFUNDED",
+      };
+    }
+
+    if (payment.status !== "SUCCEEDED") {
+      throw new Error(
+        `Cannot refund payment ${operationId} in status ${payment.status}`,
+      );
+    }
+
+    payment.status = "REFUNDED";
+    payment.refundIdempotencyKey = compensationIdempotencyKey;
+    this.payments.push({ ...payment, duplicate: false, refund: true });
+    return {
+      transactionId: payment.transactionId,
+      operationId: payment.operationId,
+      amount: payment.amount,
+      status: "REFUNDED",
+    };
+  }
+
+  /**
+   * Request a permanent or retryable failure on a RUNNING task.
+   * @param {string} [taskKey]
+   * @param {{ code?: string, message?: string }} [error]
+   */
+  failWorker(taskKey, error = { code: "FATAL", message: "injected failure" }) {
+    const key = taskKey ?? this.runningTaskKeys()[0];
+    if (!key) return false;
+    const task = this.tasks.get(key);
+    if (!task || task.status !== "RUNNING") return false;
+    const attempt = this.runningAttemptFor(task);
+    if (!attempt || attempt.status !== "RUNNING") return false;
+    if (this.crashRequested.has(attempt.id)) return false;
+    if (this.failRequested.has(attempt.id)) return false;
+
+    this.failRequested.set(attempt.id, {
+      code: error.code,
+      message: error.message ?? "injected failure",
+    });
+    return true;
+  }
+
+  canFail(taskKey) {
+    if (this.workflowStatus !== "RUNNING") return false;
+    const running = this.runningTaskKeys();
+    if (taskKey) return running.includes(taskKey);
+    return running.length > 0;
+  }
+
+  /** Match cancelWorkflow.ts */
+  cancelWorkflow() {
+    if (this.workflowStatus !== "RUNNING") {
+      return { outcome: "ALREADY_TERMINAL", status: this.workflowStatus };
+    }
+
+    this.workflowStatus = "CANCELLED";
+
+    for (const task of this.tasks.values()) {
+      if (task.status !== "RUNNING") continue;
+      const attempt = this.runningAttemptFor(task);
+      if (attempt?.status === "RUNNING") {
+        this.stopHeartbeat(attempt.id);
+        attempt.status = "TIMED_OUT";
+        attempt.error = { reason: "WORKFLOW_CANCELLED" };
+      }
+    }
+
+    for (const task of this.tasks.values()) {
+      if (["PENDING", "READY", "RUNNING"].includes(task.status)) {
+        task.status = "CANCELLED";
+        task.nextRetryAt = null;
+      }
+    }
+
+    this.outbox = [];
+    this.appendEvent("WORKFLOW_CANCELLED", { workflowId: this.workflowId });
+    return { outcome: "CANCELLED" };
+  }
+
+  /** Match handleAttemptFailure.ts + startCompensation.ts */
+  failAttempt(task, attempt, error) {
+    if (
+      attempt.status !== "RUNNING" ||
+      this.workflowStatus !== "RUNNING" ||
+      task.status !== "RUNNING"
+    ) {
+      return { outcome: "STALE_ATTEMPT" };
+    }
+
+    attempt.status = "FAILED";
+    attempt.error = error;
+
+    const attemptNumber = attempt.attemptNumber;
+    const shouldRetry =
+      isRetryable(error) && attemptNumber < this.retryPolicy.maxAttempts;
+
+    if (shouldRetry) {
+      const delayMs = calculateRetryDelay(attemptNumber, this.retryPolicy);
+      task.status = "READY";
+      task.error = error;
+      task.nextRetryAt = this.now() + delayMs;
+
+      this.appendEvent("TASK_RETRY_SCHEDULED", {
+        taskKey: task.key,
+        taskId: task.id,
+        attemptNumber,
+        delayMs,
+        error,
+      });
+
+      if (attempt.consumerId) {
+        this.setConsumer(attempt.consumerId, `retry ${task.key}`);
+      }
+
+      return { outcome: "RETRY_SCHEDULED", delayMs };
+    }
+
+    task.status = "FAILED";
+    task.error = error;
+    task.nextRetryAt = null;
+
+    for (const other of this.tasks.values()) {
+      if (other.id === task.id) continue;
+      if (other.status === "RUNNING") {
+        const otherAttempt = this.runningAttemptFor(other);
+        if (otherAttempt?.status === "RUNNING") {
+          this.stopHeartbeat(otherAttempt.id);
+          otherAttempt.status = "TIMED_OUT";
+          otherAttempt.error = { reason: "WORKFLOW_COMPENSATING" };
+        }
+      }
+      if (["PENDING", "READY", "RUNNING"].includes(other.status)) {
+        other.status = "CANCELLED";
+        other.nextRetryAt = null;
+      }
+    }
+
+    this.appendEvent("TASK_FAILED", {
+      taskKey: task.key,
+      taskId: task.id,
+      attemptNumber,
+      error,
+    });
+
+    if (attempt.consumerId) {
+      this.setConsumer(attempt.consumerId, `failed ${task.key}`);
+    }
+
+    return {
+      outcome: "FAILED",
+      compensation: this.startCompensation(task.id, error),
+    };
+  }
+
+  startCompensation(failedTaskId, error) {
+    if (this.workflowStatus === "COMPENSATING") {
+      return { outcome: "ALREADY_COMPENSATING" };
+    }
+    if (this.workflowStatus !== "RUNNING") {
+      return { outcome: "WORKFLOW_TERMINAL", status: this.workflowStatus };
+    }
+
+    const toCompensate = [...this.tasks.values()].filter(
+      (t) =>
+        t.status === "COMPLETED" && COMPENSATION_REGISTRY[t.type] != null,
+    );
+
+    if (toCompensate.length === 0) {
+      this.workflowStatus = "FAILED";
+      this.appendEvent("WORKFLOW_FAILED", {
+        workflowId: this.workflowId,
+        failedTaskId,
+        error,
+      });
+      return {
+        outcome: "FAILED_NO_COMPENSATION",
+        compensationRecordsConsidered: 0,
+      };
+    }
+
+    this.workflowStatus = "COMPENSATING";
+    this.appendEvent("WORKFLOW_COMPENSATION_STARTED", {
+      workflowId: this.workflowId,
+      failedTaskId,
+      error,
+    });
+
+    for (const task of toCompensate) {
+      const definition = COMPENSATION_REGISTRY[task.type];
+      const idempotencyKey = `compensate:${this.workflowId}:${task.id}:${definition.type}`;
+      if (this.compensations.some((c) => c.idempotencyKey === idempotencyKey)) {
+        continue;
+      }
+      this.compensations.push({
+        id: uuid(),
+        taskKey: task.key,
+        taskId: task.id,
+        idempotencyKey,
+        compensationType: definition.type,
+        originalOperationId: task.operationId,
+        status: "PENDING",
+        attemptCount: 0,
+        fencingToken: 0,
+        result: null,
+        error: null,
+      });
+    }
+
+    return {
+      outcome: "COMPENSATION_STARTED",
+      compensationRecordsConsidered: toCompensate.length,
+    };
+  }
+
+  publishDueRetries() {
+    if (this.workflowStatus !== "RUNNING") return 0;
+    const now = this.now();
+    let published = 0;
+
+    for (const task of this.tasks.values()) {
+      if (
+        task.status !== "READY" ||
+        task.nextRetryAt == null ||
+        task.nextRetryAt > now
+      ) {
+        continue;
+      }
+
+      task.nextRetryAt = null;
+      this.scheduleReady(task.key);
+      published += 1;
+    }
+
+    return published;
+  }
+
+  compensationBlocked(comp) {
+    // Reverse-DAG: wait until compensations for dependents finish first.
+    for (const dependentKey of this.dependents.get(comp.taskKey) ?? []) {
+      const child = this.compensations.find((c) => c.taskKey === dependentKey);
+      if (child && child.status !== "COMPLETED") return true;
+    }
+    return false;
+  }
+
+  runCompensationOnce() {
+    if (this.workflowStatus !== "COMPENSATING") return false;
+
+    const candidate = this.compensations.find(
+      (c) =>
+        (c.status === "PENDING" || c.status === "READY") &&
+        !this.compensationBlocked(c),
+    );
+    if (!candidate) return false;
+
+    candidate.status = "RUNNING";
+    candidate.attemptCount += 1;
+    candidate.fencingToken += 1;
+
+    try {
+      if (candidate.compensationType !== "REFUND_PAYMENT") {
+        throw new Error(
+          `Unsupported compensation: ${candidate.compensationType}`,
+        );
+      }
+      const result = this.refundPayment(
+        candidate.originalOperationId,
+        candidate.idempotencyKey,
+      );
+      candidate.status = "COMPLETED";
+      candidate.result = result;
+      this.appendEvent("COMPENSATION_COMPLETED", {
+        compensationId: candidate.id,
+        taskKey: candidate.taskKey,
+        taskId: candidate.taskId,
+        type: candidate.compensationType,
+      });
+    } catch (err) {
+      const error = {
+        message: err instanceof Error ? err.message : String(err),
+      };
+      const retry =
+        isRetryable(error) &&
+        candidate.attemptCount < this.retryPolicy.maxAttempts;
+      candidate.error = error;
+      candidate.status = retry ? "READY" : "FAILED";
+      if (!retry) {
+        this.appendEvent("COMPENSATION_FAILED", {
+          compensationId: candidate.id,
+          taskKey: candidate.taskKey,
+          error,
+        });
+      }
+    }
+
+    const unfinished = this.compensations.some((c) => c.status !== "COMPLETED");
+    if (!unfinished && this.workflowStatus === "COMPENSATING") {
+      this.workflowStatus = "FAILED";
+      this.appendEvent("WORKFLOW_FAILED", {
+        workflowId: this.workflowId,
+        reason: "FORWARD_EXECUTION_FAILED_COMPENSATIONS_COMPLETED",
+      });
+    }
+
+    return true;
   }
 
   async waitOrCrash(attempt, ms) {
     let left = ms;
     while (left > 0) {
       if (!this.running) return "stopped";
+      if (attempt.status !== "RUNNING") return "stopped";
+      if (this.workflowStatus !== "RUNNING") return "stopped";
       if (this.crashRequested.has(attempt.id)) return "crashed";
+      if (this.failRequested.has(attempt.id)) return "failed";
       const slice = Math.min(WAIT_SLICE, left);
       await sleep(slice);
       left -= slice;
     }
     if (this.crashRequested.has(attempt.id)) return "crashed";
+    if (this.failRequested.has(attempt.id)) return "failed";
+    if (attempt.status !== "RUNNING" || this.workflowStatus !== "RUNNING") {
+      return "stopped";
+    }
     return "ok";
   }
 
@@ -673,7 +1083,23 @@ export class MiniTemporalEngine {
         return;
       }
 
+      if (aborted === "failed" || this.failRequested.has(attempt.id)) {
+        const injected = this.failRequested.get(attempt.id) ?? {
+          code: "FATAL",
+          message: "injected failure",
+        };
+        this.failRequested.delete(attempt.id);
+        this.failAttempt(task, attempt, injected);
+        onTick?.();
+        return;
+      }
+
       if (aborted || result == null) return;
+
+      if (this.workflowStatus !== "RUNNING" || task.status !== "RUNNING") {
+        onTick?.();
+        return;
+      }
 
       const completed = this.completeAttempt(
         task,
@@ -727,10 +1153,11 @@ export class MiniTemporalEngine {
   }
 
   checkWorkflowComplete(onTick) {
+    if (this.workflowStatus !== "RUNNING") return;
     const allDone = [...this.tasks.values()].every(
       (t) => t.status === "COMPLETED",
     );
-    if (allDone && this.workflowStatus === "RUNNING") {
+    if (allDone) {
       this.workflowStatus = "COMPLETED";
       this.appendEvent("WORKFLOW_COMPLETED", { workflowId: this.workflowId });
       onTick?.();
@@ -742,12 +1169,21 @@ export class MiniTemporalEngine {
       return true;
     }
     if (this.zombies.length > 0) return true;
-    return [...this.tasks.values()].some(
-      (t) =>
-        t.status === "READY" ||
-        t.status === "RUNNING" ||
-        t.status === "PENDING",
-    );
+
+    if (this.workflowStatus === "COMPENSATING") {
+      // FAILED compensations need intervention; stop the sim loop.
+      return this.compensations.some(
+        (c) => !["COMPLETED", "FAILED"].includes(c.status),
+      );
+    }
+
+    if (this.workflowStatus !== "RUNNING") return false;
+
+    return [...this.tasks.values()].some((t) => {
+      if (t.status === "RUNNING" || t.status === "PENDING") return true;
+      if (t.status === "READY") return true;
+      return false;
+    });
   }
 
   async run(onTick) {
@@ -759,12 +1195,20 @@ export class MiniTemporalEngine {
     const publisher = this.publishOutbox((msg) => enqueue(msg));
 
     while (this.running) {
+      this.publishDueRetries();
+
       while (workerQueue.length > 0 && this.running) {
         const msg = workerQueue.shift();
         const p = this.dispatch(msg.taskKey, onTick).finally(() =>
           inflight.delete(p),
         );
         inflight.add(p);
+      }
+
+      if (this.workflowStatus === "COMPENSATING") {
+        while (this.runCompensationOnce()) {
+          onTick?.();
+        }
       }
 
       this.checkWorkflowComplete(onTick);
@@ -807,6 +1251,8 @@ export function eventSentence(ev) {
       return `${name} is ready.`;
     case "OUTBOX_PUBLISHED":
       return `${name} was sent to workers.`;
+    case "OUTBOX_DISCARDED":
+      return `${name} dispatch dropped — workflow ${d.workflowStatus}.`;
     case "CLAIM_WON":
       return `Consumer ${d.consumerId ?? "?"} claimed ${name}.`;
     case "CLAIM_SKIPPED":
@@ -817,8 +1263,25 @@ export function eventSentence(ev) {
       return `Worker ${d.consumerId ?? "?"} crashed on ${name}. Lease still live.`;
     case "TASK_RECOVERY":
       return `Lease expired. ${name} is ready again.`;
+    case "TASK_RETRY_SCHEDULED":
+      return `${name} failed retryably. Backoff ${(d.delayMs / 1000).toFixed(1)}s.`;
+    case "TASK_FAILED":
+      return `${name} failed permanently.`;
     case "TASK_COMPLETED":
       return `${name} completed.`;
+    case "WORKFLOW_COMPENSATION_STARTED":
+      return "Saga started. Undoing completed work.";
+    case "COMPENSATION_COMPLETED":
+      return `Compensation ${d.type ?? ""} on ${name} done.`.replace(
+        /  +/g,
+        " ",
+      );
+    case "COMPENSATION_FAILED":
+      return `Compensation on ${name} failed.`;
+    case "WORKFLOW_CANCELLED":
+      return "Workflow cancelled.";
+    case "WORKFLOW_FAILED":
+      return "Workflow failed after compensation.";
     case "WORKFLOW_COMPLETED":
       return "Workflow finished.";
     case "STALE_RESULT_REJECTED":
@@ -831,8 +1294,26 @@ export function eventSentence(ev) {
 /** @param {MiniTemporalEngine | null} engine */
 export function labPhase(engine, now = Date.now(), finishedLab = false) {
   if (!engine) return finishedLab ? "lab-done" : "idle";
+  if (engine.runKind === "saga") {
+    if (engine.workflowStatus === "FAILED") return "saga-done";
+    if (engine.workflowStatus === "COMPENSATING") return "saga-compensate";
+    const email = engine.tasks.get("email");
+    if (email?.status === "RUNNING") return "saga-fail";
+    if (email?.status === "FAILED") return "saga-compensate";
+    if (
+      engine.tasks.get("charge")?.status === "COMPLETED" &&
+      engine.tasks.get("reserve")?.status === "COMPLETED"
+    ) {
+      return "saga-wait-email";
+    }
+    return "saga-run";
+  }
   if (engine.runKind !== "lab") {
-    return engine.workflowStatus === "COMPLETED" ? "free-done" : "free";
+    if (engine.workflowStatus === "COMPLETED") return "free-done";
+    if (engine.workflowStatus === "FAILED") return "free-failed";
+    if (engine.workflowStatus === "CANCELLED") return "free-cancelled";
+    if (engine.workflowStatus === "COMPENSATING") return "free-compensating";
+    return "free";
   }
   if (engine.workflowStatus === "COMPLETED") return "lab-done";
   if (engine.dyingAttempt(now)) return "wait-lease";
@@ -845,15 +1326,23 @@ export function labPhase(engine, now = Date.now(), finishedLab = false) {
 }
 
 const NARRATION = {
-  idle: "Start the lab. Verify Email will run and wait until you crash its worker.",
+  idle: "Start the crash lab, or the saga lab to watch charge → fail → refund.",
   queued: "Verify Email is queued. Worker A will claim it.",
   crash: "Verify Email will not finish by itself. Press Crash worker (or the pulsing node).",
   "wait-lease": "Worker is dead. Recover is armed — it runs when the lease hits 0. Click it now to queue.",
   recover: "Lease expired. Press Recover stale. A and B then race the retry.",
   watch: "Retry is in flight. One consumer wins, the other skips. Rest of the graph runs to done.",
-  "lab-done": "Lab done. Run it again, or start a free workflow and crash any node.",
-  free: "Free play. Crash a running node, wait out the lease, then Recover stale.",
-  "free-done": "Workflow finished. Start another, switch workflow, or run the lab again.",
+  "lab-done": "Lab done. Run crash or saga again, or free-play any workflow.",
+  free: "Free play. Crash, fail, or cancel a running workflow. Fail a task after charge to see refund.",
+  "free-done": "Workflow finished. Start another, switch workflow, or run a lab again.",
+  "free-failed": "Workflow failed. Compensations finished. Start another run.",
+  "free-cancelled": "Workflow cancelled. Open tasks stopped; in-flight claims are fenced out.",
+  "free-compensating": "Undoing completed work (refund). Workflow ends FAILED when done.",
+  "saga-run": "Charge and reserve run first. Confirmation will wait for both.",
+  "saga-wait-email": "Charge and reserve done. Confirmation is next — it will fail on purpose.",
+  "saga-fail": "Confirmation is running. Press Fail task (or wait — lab fails it for you).",
+  "saga-compensate": "Permanent failure. Saga refunds the charge, then workflow fails.",
+  "saga-done": "Saga done. Payment refunded. Run again or try free play.",
 };
 
 function beatForPhase(phase) {
@@ -875,8 +1364,11 @@ if (typeof document !== "undefined") {
   const presetSelect = $("#preset");
   const presetWrap = $("#preset-wrap");
   const startLabBtn = $("#start-lab-btn");
+  const startSagaBtn = $("#start-saga-btn");
   const startFreeBtn = $("#start-free-btn");
   const crashBtn = $("#crash-btn");
+  const failBtn = $("#fail-btn");
+  const cancelBtn = $("#cancel-btn");
   const recoverBtn = $("#recover-btn");
   const resetBtn = $("#reset-btn");
   const wfStatus = $("#wf-status");
@@ -894,6 +1386,10 @@ if (typeof document !== "undefined") {
   const payTable = $("#pay-table");
   const payRows = $("#pay-rows");
   const payEmpty = $("#pay-empty");
+  const compPanel = $("#comp-panel");
+  const compTable = $("#comp-table");
+  const compRows = $("#comp-rows");
+  const compEmpty = $("#comp-empty");
   const narration = $("#narration");
   const beats = $("#beats");
   const engineDetail = $("#engine-detail");
@@ -939,14 +1435,16 @@ if (typeof document !== "undefined") {
     const phase = labPhase(engine, Date.now(), labDone);
     narration.textContent = NARRATION[phase] ?? NARRATION.idle;
     const currentBeat = beatForPhase(phase);
-    const inLabChrome =
-      (!labDone && (!engine || engine.runKind === "lab")) ||
-      (engine?.runKind === "lab" && engine.workflowStatus === "RUNNING");
-    beats.hidden =
-      !inLabChrome ||
-      phase === "free" ||
-      phase === "free-done" ||
-      phase === "lab-done";
+    const inCrashLab =
+      engine?.runKind === "lab" &&
+      (engine.workflowStatus === "RUNNING" ||
+        engine.workflowStatus === "COMPLETED");
+    const showBeats =
+      (inCrashLab || (!labDone && !engine)) &&
+      !String(phase).startsWith("free") &&
+      !String(phase).startsWith("saga") &&
+      phase !== "lab-done";
+    beats.hidden = !showBeats;
     if (!beats.hidden) {
       const currentIdx = BEAT_ORDER.indexOf(currentBeat ?? "start");
       for (const li of beats.querySelectorAll("[data-beat]")) {
@@ -981,7 +1479,12 @@ if (typeof document !== "undefined") {
   }
 
   function renderEngineDetail() {
-    const show = labDone;
+    const show =
+      labDone ||
+      Boolean(
+        engine &&
+          ["COMPLETED", "FAILED", "CANCELLED"].includes(engine.workflowStatus),
+      );
     engineDetail.hidden = !show;
     if (!show || !engine) {
       engineJson.textContent = "";
@@ -1044,14 +1547,49 @@ if (typeof document !== "undefined") {
 
     for (const pay of engine.payments) {
       const tr = document.createElement("tr");
-      const hit = pay.duplicate ? "duplicate" : "first";
+      const hit = pay.refund
+        ? pay.duplicate
+          ? "refund-dup"
+          : "refund"
+        : pay.duplicate
+          ? "duplicate"
+          : "first";
       tr.innerHTML = `
       <td title="${pay.operationId}">${shortId(pay.operationId)}</td>
       <td title="${pay.transactionId}">${shortId(pay.transactionId)}</td>
       <td>${pay.amount}</td>
-      <td><span class="${pay.duplicate ? "hit-dup" : "hit-first"}">${hit}</span></td>
+      <td><span class="status-chip ${pay.status.toLowerCase()}">${pay.status}</span></td>
+      <td><span class="${pay.duplicate || pay.refund ? "hit-dup" : "hit-first"}">${hit}</span></td>
     `;
       payRows.appendChild(tr);
+    }
+  }
+
+  function renderCompensations() {
+    const showPanel = Boolean(engine) && engine.compensations.length > 0;
+    compPanel.hidden = !showPanel;
+    if (!showPanel) return;
+
+    if (engine.compensations.length === 0) {
+      compTable.hidden = true;
+      compEmpty.hidden = false;
+      return;
+    }
+
+    compEmpty.hidden = true;
+    compTable.hidden = false;
+    compRows.innerHTML = "";
+
+    for (const comp of engine.compensations) {
+      const tr = document.createElement("tr");
+      const statusClass = comp.status.toLowerCase();
+      tr.innerHTML = `
+      <td>${taskTitle(comp.taskKey)}</td>
+      <td>${comp.compensationType}</td>
+      <td>${comp.attemptCount}</td>
+      <td><span class="status-chip ${statusClass}">${comp.status}</span></td>
+    `;
+      compRows.appendChild(tr);
     }
   }
 
@@ -1162,30 +1700,49 @@ if (typeof document !== "undefined") {
   }
 
   function syncButtons() {
-    const live = Boolean(engine) && engine.workflowStatus === "RUNNING";
-    const idle = !live;
+    const active =
+      Boolean(engine) &&
+      (engine.workflowStatus === "RUNNING" ||
+        engine.workflowStatus === "COMPENSATING");
+    const idle = !active;
 
     presetWrap.hidden = !labDone;
-    presetSelect.disabled = live;
+    presetSelect.disabled = active;
 
     startLabBtn.hidden = !idle;
-    startLabBtn.textContent = labDone ? "Run lab again" : "Start lab";
-    startLabBtn.disabled = live;
+    startLabBtn.textContent = labDone ? "Crash lab again" : "Crash lab";
+    startLabBtn.disabled = active;
+
+    startSagaBtn.hidden = !idle;
+    startSagaBtn.textContent = labDone ? "Saga lab again" : "Saga lab";
+    startSagaBtn.disabled = active;
 
     startFreeBtn.hidden = !labDone || !idle;
-    startFreeBtn.disabled = live;
+    startFreeBtn.disabled = active;
 
     crashBtn.disabled = !engine || !engine.canCrash();
     crashBtn.classList.toggle(
       "need-action",
       Boolean(engine && engine.canCrash()),
     );
+
+    const canFail = Boolean(engine && engine.canFail());
+    failBtn.disabled = !canFail;
+    failBtn.classList.toggle(
+      "need-action",
+      canFail && engine?.runKind === "saga",
+    );
+
+    cancelBtn.disabled = !engine || engine.workflowStatus !== "RUNNING";
     resetBtn.hidden = !engine;
 
     const dying = engine?.dyingAttempt();
     const stale = engine ? engine.staleAttempts().length > 0 : false;
     recoverBtn.disabled = !engine || !(stale || dying || engine.recoverQueued);
-    recoverBtn.classList.toggle("need-action", stale || Boolean(engine?.recoverQueued));
+    recoverBtn.classList.toggle(
+      "need-action",
+      stale || Boolean(engine?.recoverQueued),
+    );
     if (dying) {
       const ms = Math.max(0, dying.leaseUntil - Date.now());
       recoverBtn.textContent = engine.recoverQueued
@@ -1195,13 +1752,19 @@ if (typeof document !== "undefined") {
       recoverBtn.textContent = "Recover stale";
     }
 
-    if (engine?.runKind === "lab" && engine.workflowStatus === "COMPLETED") {
+    if (
+      engine &&
+      ["COMPLETED", "FAILED", "CANCELLED"].includes(engine.workflowStatus)
+    ) {
       labDone = true;
     }
   }
 
   function renderAll() {
-    if (engine?.runKind === "lab" && engine.workflowStatus === "COMPLETED") {
+    if (
+      engine &&
+      ["COMPLETED", "FAILED", "CANCELLED"].includes(engine.workflowStatus)
+    ) {
       labDone = true;
     }
     renderMeta();
@@ -1209,6 +1772,7 @@ if (typeof document !== "undefined") {
     renderEvents();
     renderAttempts();
     renderPayments();
+    renderCompensations();
     renderConsumers();
     renderGuide();
     renderEngineDetail();
@@ -1224,13 +1788,37 @@ if (typeof document !== "undefined") {
     };
   }
 
+  function sagaOptions() {
+    return {
+      dualClaim: true,
+      runKind: "saga",
+      activityMs: 1600,
+    };
+  }
+
   async function runEngine(next) {
     engine?.stop();
     engine = next;
     engine.start();
     renderAll();
-    await engine.run(renderAll);
-    if (engine.runKind === "lab" && engine.workflowStatus === "COMPLETED") {
+    await engine.run(() => {
+      // Saga lab: once confirmation is running, fail it permanently.
+      if (
+        engine?.runKind === "saga" &&
+        engine.workflowStatus === "RUNNING" &&
+        engine.tasks.get("email")?.status === "RUNNING"
+      ) {
+        engine.failWorker("email", {
+          code: "FATAL",
+          message: "confirmation rejected",
+        });
+      }
+      renderAll();
+    });
+    if (
+      engine &&
+      ["COMPLETED", "FAILED", "CANCELLED"].includes(engine.workflowStatus)
+    ) {
       labDone = true;
     }
     renderAll();
@@ -1239,6 +1827,11 @@ if (typeof document !== "undefined") {
   async function startLab() {
     presetSelect.value = "onboarding";
     await runEngine(new MiniTemporalEngine(PRESETS.onboarding, labOptions()));
+  }
+
+  async function startSaga() {
+    presetSelect.value = "checkout";
+    await runEngine(new MiniTemporalEngine(PRESETS.checkout, sagaOptions()));
   }
 
   async function startFree() {
@@ -1257,10 +1850,22 @@ if (typeof document !== "undefined") {
   }
 
   startLabBtn.addEventListener("click", startLab);
+  startSagaBtn.addEventListener("click", startSaga);
   startFreeBtn.addEventListener("click", startFree);
   resetBtn.addEventListener("click", resetDemo);
   crashBtn.addEventListener("click", () => {
     engine?.crashWorker();
+    renderAll();
+  });
+  failBtn.addEventListener("click", () => {
+    engine?.failWorker(undefined, {
+      code: "FATAL",
+      message: "injected failure",
+    });
+    renderAll();
+  });
+  cancelBtn.addEventListener("click", () => {
+    engine?.cancelWorkflow();
     renderAll();
   });
   recoverBtn.addEventListener("click", () => {
@@ -1270,9 +1875,16 @@ if (typeof document !== "undefined") {
   dagNodes.addEventListener("click", (e) => {
     const g = e.target.closest(".dag-node");
     const key = g?.dataset.key;
-    if (!key || !engine || !engine.canCrash(key)) return;
-    engine.crashWorker(key);
-    renderAll();
+    if (!key || !engine) return;
+    if (engine.canCrash(key)) {
+      engine.crashWorker(key);
+      renderAll();
+      return;
+    }
+    if (engine.canFail(key)) {
+      engine.failWorker(key, { code: "FATAL", message: "injected failure" });
+      renderAll();
+    }
   });
   presetSelect.addEventListener("change", () => {
     if (!engine) renderAll();
