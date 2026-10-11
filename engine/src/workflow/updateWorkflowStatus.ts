@@ -1,4 +1,5 @@
 import type { PoolClient } from "pg";
+import { appendWorkflowEvent } from "./appendWorkflowEvent";
 
 export async function updateWorkflowStatus(
   client: PoolClient,
@@ -38,36 +39,10 @@ export async function updateWorkflowStatus(
     return false;
   }
 
-  const sequenceResult = await client.query(
-    `
-    SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-    FROM workflow_events
-    WHERE workflow_id = $1
-    `,
-    [workflowId],
-  );
-
-  const sequence = Number(sequenceResult.rows[0].sequence);
-
-  await client.query(
-    `
-    INSERT INTO workflow_events (
-      id,
-      workflow_id,
-      sequence,
-      event_type,
-      data
-    )
-    VALUES ($1, $2, $3, $4, $5)
-    `,
-    [
-      crypto.randomUUID(),
-      workflowId,
-      sequence,
-      "WORKFLOW_COMPLETED",
-      JSON.stringify({ workflowId }),
-    ],
-  );
-
+  await appendWorkflowEvent(client, {
+    workflowId,
+    eventType: "WORKFLOW_COMPLETED",
+    data: { workflowId },
+  });
   return true;
 }

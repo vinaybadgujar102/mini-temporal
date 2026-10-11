@@ -229,8 +229,10 @@ describe.skipIf(!hasDb)("workflow cancellation (integration)", () => {
       [claimB!.attemptId],
     );
 
-    const outboxBefore = await outboxTaskReadyCount(workflowId);
     await cancelWorkflow(pool, workflowId);
+    // Cancel clears unpublished TASK_READY rows; measure after that so we
+    // only assert recovery does not requeue.
+    const outboxBefore = await outboxTaskReadyCount(workflowId);
 
     await recoverStaleTasks();
 

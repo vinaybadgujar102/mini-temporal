@@ -1,9 +1,11 @@
+import crypto from "node:crypto";
 import type { PoolClient } from "pg";
 import {
   calculateRetryDelay,
   defaultRetryPolicy,
   isRetryable,
 } from "./retryPolicy";
+import { startCompensation } from "../workflow/startCompensation";
 
 type FailureInput = {
   client: PoolClient;
@@ -166,7 +168,7 @@ export async function handleAttemptFailure({
       };
     }
 
-    // 6b. Permanent failure: fail the task and workflow atomically.
+    // 6b. Permanent failure: fail the task and begin compensation.
     await client.query(
       `
       UPDATE tasks
@@ -181,24 +183,7 @@ export async function handleAttemptFailure({
       [taskId, JSON.stringify(error), resolvedWorkflowId],
     );
 
-    const workflowUpdate = await client.query(
-      `
-      UPDATE workflows
-      SET status = 'FAILED',
-          updated_at = NOW()
-      WHERE id = $1
-        AND status = 'RUNNING'
-      RETURNING id
-      `,
-      [resolvedWorkflowId],
-    );
-
-    if (workflowUpdate.rowCount !== 1) {
-      throw new Error(
-        `Could not transition workflow ${resolvedWorkflowId} to FAILED`,
-      );
-    }
-
+    // Invalidate other running attempts.
     await client.query(
       `
       UPDATE task_attempts a
@@ -208,15 +193,18 @@ export async function handleAttemptFailure({
       FROM tasks t
       WHERE t.id = a.task_id
         AND t.workflow_id = $1
+        AND t.id <> $3
         AND t.status = 'RUNNING'
         AND a.status = 'RUNNING'
       `,
       [
         resolvedWorkflowId,
-        JSON.stringify({ reason: "WORKFLOW_FAILED" }),
+        JSON.stringify({ reason: "WORKFLOW_COMPENSATING" }),
+        taskId,
       ],
     );
 
+    // Cancel all other executable tasks.
     await client.query(
       `
       UPDATE tasks
@@ -224,24 +212,13 @@ export async function handleAttemptFailure({
           next_retry_at = NULL,
           updated_at = NOW()
       WHERE workflow_id = $1
-        AND status = 'RUNNING'
         AND id <> $2
+        AND status IN ('PENDING', 'READY', 'RUNNING')
       `,
       [resolvedWorkflowId, taskId],
     );
 
-    await client.query(
-      `
-      UPDATE tasks
-      SET status = 'CANCELLED',
-          next_retry_at = NULL,
-          updated_at = NOW()
-      WHERE workflow_id = $1
-        AND status IN ('PENDING', 'READY')
-      `,
-      [resolvedWorkflowId],
-    );
-
+    // Record the failed task event.
     const sequenceResult = await client.query(
       `
       SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
@@ -251,8 +228,6 @@ export async function handleAttemptFailure({
       [resolvedWorkflowId],
     );
 
-    let sequence = Number(sequenceResult.rows[0].sequence);
-
     await client.query(
       `
       INSERT INTO workflow_events (
@@ -263,31 +238,27 @@ export async function handleAttemptFailure({
       [
         crypto.randomUUID(),
         resolvedWorkflowId,
-        sequence++,
+        Number(sequenceResult.rows[0].sequence),
         "TASK_FAILED",
         JSON.stringify({ taskId, attemptNumber, error }),
       ],
     );
 
-    await client.query(
-      `
-      INSERT INTO workflow_events (
-        id, workflow_id, sequence, event_type, data
-      )
-      VALUES ($1, $2, $3, $4, $5::jsonb)
-      `,
-      [
-        crypto.randomUUID(),
-        resolvedWorkflowId,
-        sequence,
-        "WORKFLOW_FAILED",
-        JSON.stringify({ workflowId: resolvedWorkflowId, taskId, error }),
-      ],
+    // Transitions RUNNING -> COMPENSATING and creates durable
+    // compensation intents in this same transaction.
+    const compensation = await startCompensation(
+      client,
+      resolvedWorkflowId,
+      taskId,
+      error,
     );
 
     await client.query("COMMIT");
 
-    return { outcome: "FAILED" as const };
+    return {
+      outcome: "FAILED" as const,
+      compensation,
+    };
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
