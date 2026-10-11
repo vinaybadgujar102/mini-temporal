@@ -29,6 +29,12 @@
   box-sizing: border-box;
 }
 
+/* Author display rules (e.g. .preset-picker { display: flex }) beat the UA
+   [hidden] stylesheet. Keep hidden actually hidden. */
+[hidden] {
+  display: none !important;
+}
+
 html {
   font-size: 16px;
 }
@@ -176,6 +182,15 @@ button {
 
 .guide {
   margin: -1.5rem 0 1.75rem;
+  padding: 0.85rem 1rem;
+  background: var(--ink-soft);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+
+.guide.needs-you {
+  border-color: var(--ready);
+  box-shadow: inset 3px 0 0 var(--ready);
 }
 
 .beats {
@@ -375,20 +390,33 @@ button:focus-visible {
 
 .dag-empty {
   position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  left: 50%;
+  bottom: 0.75rem;
+  transform: translateX(-50%);
   margin: 0;
-  padding: 1rem;
+  max-width: 36ch;
+  padding: 0.5rem 0.75rem;
   text-align: center;
-  font-size: 0.875rem;
-  color: var(--paper-dim);
+  font-size: 0.8125rem;
+  color: var(--paper);
+  background: color-mix(in srgb, var(--ink) 88%, transparent);
+  border: 1px solid var(--line);
+  border-radius: 2px;
   pointer-events: none;
 }
 
-.dag-empty[hidden] {
-  display: none;
+.dag-empty strong {
+  font-weight: 700;
+  color: var(--paper);
+}
+
+.dag-node.preview {
+  opacity: 0.45;
+}
+
+.dag-node.preview rect {
+  stroke: var(--line);
+  fill: var(--ink);
 }
 
 .dag-node {
@@ -532,6 +560,9 @@ button:focus-visible {
 }
 .dot.cancelled {
   background: var(--cancelled);
+}
+.dot.compensating {
+  background: var(--compensating);
 }
 
 .lease-bar {

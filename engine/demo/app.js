@@ -128,10 +128,10 @@ export const PRESETS = {
   },
 };
 
-const ACTIVITY_MS = 4200;
-const OUTBOX_MS = 400;
-const LEASE_MS = 5000;
-const HEARTBEAT_MS = 1200;
+const ACTIVITY_MS = 2800;
+const OUTBOX_MS = 280;
+const LEASE_MS = 3000;
+const HEARTBEAT_MS = 900;
 const PAYMENT_AMOUNT = 4999;
 const WAIT_SLICE = 80;
 
@@ -1318,32 +1318,49 @@ export function labPhase(engine, now = Date.now(), finishedLab = false) {
   if (engine.workflowStatus === "COMPLETED") return "lab-done";
   if (engine.dyingAttempt(now)) return "wait-lease";
   if (engine.staleAttempts().length) return "recover";
+  // After the teaching crash, stay on "watch" through the dual-claim retry
+  // (attemptCount is still 1 while the recovered task sits READY).
+  if (engine.labCrashUsed) return "watch";
   const verify = engine.tasks.get("verify");
   if (verify?.status === "RUNNING" && verify.attemptCount === 1) return "crash";
-  if ((verify?.attemptCount ?? 0) >= 2) return "watch";
   if (engine.tasks.size > 0) return "queued";
   return "start";
 }
 
 const NARRATION = {
-  idle: "Start the crash lab, or the saga lab to watch charge → fail → refund.",
+  idle: "Pick a lab. Crash lab teaches leases and fencing. Saga lab charges, fails confirmation, then refunds.",
   queued: "Verify Email is queued. Worker A will claim it.",
-  crash: "Verify Email will not finish by itself. Press Crash worker (or the pulsing node).",
-  "wait-lease": "Worker is dead. Recover is armed — it runs when the lease hits 0. Click it now to queue.",
-  recover: "Lease expired. Press Recover stale. A and B then race the retry.",
-  watch: "Retry is in flight. One consumer wins, the other skips. Rest of the graph runs to done.",
-  "lab-done": "Lab done. Run crash or saga again, or free-play any workflow.",
-  free: "Free play. Crash, fail, or cancel a running workflow. Fail a task after charge to see refund.",
+  crash: "Verify Email waits for you. Press Crash worker (or the pulsing node).",
+  "wait-lease": "Worker is dead. Press Recover stale now — it queues until the lease hits 0.",
+  recover: "Lease expired. Press Recover stale. Workers A and B race the retry.",
+  watch: "Race in flight. One worker wins the claim; the other skips. Graph finishes.",
+  "lab-done": "Lab done. Run crash or saga again, or free-play any workflow below.",
+  free: "Free play. Crash, fail, or cancel. Fail a task after charge to see refund.",
   "free-done": "Workflow finished. Start another, switch workflow, or run a lab again.",
   "free-failed": "Workflow failed. Compensations finished. Start another run.",
   "free-cancelled": "Workflow cancelled. Open tasks stopped; in-flight claims are fenced out.",
   "free-compensating": "Undoing completed work (refund). Workflow ends FAILED when done.",
-  "saga-run": "Charge and reserve run first. Confirmation will wait for both.",
-  "saga-wait-email": "Charge and reserve done. Confirmation is next — it will fail on purpose.",
-  "saga-fail": "Confirmation is running. Press Fail task (or wait — lab fails it for you).",
-  "saga-compensate": "Permanent failure. Saga refunds the charge, then workflow fails.",
+  "saga-run": "Charge and reserve run first. Confirmation waits for both.",
+  "saga-wait-email": "Charge and reserve done. Confirmation is next — it fails on purpose.",
+  "saga-fail": "Confirmation is running. Lab fails it for you (or press Fail task).",
+  "saga-compensate": "Permanent failure. Saga refunds the charge, then the workflow fails.",
   "saga-done": "Saga done. Payment refunded. Run again or try free play.",
 };
+
+const CRASH_BEATS = [
+  { id: "start", label: "Start" },
+  { id: "crash", label: "Crash" },
+  { id: "wait-lease", label: "Wait" },
+  { id: "recover", label: "Recover" },
+  { id: "watch", label: "Race" },
+];
+
+const SAGA_BEATS = [
+  { id: "run", label: "Charge" },
+  { id: "fail", label: "Fail" },
+  { id: "refund", label: "Refund" },
+  { id: "done", label: "Done" },
+];
 
 function beatForPhase(phase) {
   if (phase === "idle" || phase === "queued" || phase === "start") return "start";
@@ -1351,10 +1368,34 @@ function beatForPhase(phase) {
   if (phase === "wait-lease") return "wait-lease";
   if (phase === "recover") return "recover";
   if (phase === "watch" || phase === "lab-done") return "watch";
+  if (phase === "saga-run" || phase === "saga-wait-email") return "run";
+  if (phase === "saga-fail") return "fail";
+  if (phase === "saga-compensate") return "refund";
+  if (phase === "saga-done") return "done";
   return null;
 }
 
-const BEAT_ORDER = ["start", "crash", "wait-lease", "recover", "watch"];
+function beatsForPhase(phase, engine) {
+  if (engine?.runKind === "saga" || String(phase).startsWith("saga")) {
+    return SAGA_BEATS;
+  }
+  if (
+    engine?.runKind === "lab" ||
+    phase === "idle" ||
+    phase === "lab-done" ||
+    ["queued", "crash", "wait-lease", "recover", "watch", "start"].includes(phase)
+  ) {
+    return CRASH_BEATS;
+  }
+  return null;
+}
+
+const ACTION_PHASES = new Set([
+  "crash",
+  "wait-lease",
+  "recover",
+  "saga-fail",
+]);
 
 // --- UI ---
 
@@ -1379,6 +1420,7 @@ if (typeof document !== "undefined") {
   const dagSvg = $("#dag-svg");
   const dagNodes = $("#dag-nodes");
   const dagEdges = $("#dag-edges");
+  const attemptPanel = $("#attempt-panel");
   const attemptTable = $("#attempt-table");
   const attemptRows = $("#attempt-rows");
   const attemptEmpty = $("#attempt-empty");
@@ -1392,6 +1434,8 @@ if (typeof document !== "undefined") {
   const compEmpty = $("#comp-empty");
   const narration = $("#narration");
   const beats = $("#beats");
+  const guide = $(".guide");
+  const consumers = $("#consumers");
   const engineDetail = $("#engine-detail");
   const engineJson = $("#engine-json");
   const consumerA = $("#consumer-A");
@@ -1400,6 +1444,8 @@ if (typeof document !== "undefined") {
   /** @type {MiniTemporalEngine | null} */
   let engine = null;
   let labDone = false;
+  /** @type {string | null} */
+  let beatsKind = null;
 
   function renderMeta() {
     if (!engine) {
@@ -1415,10 +1461,17 @@ if (typeof document !== "undefined") {
   }
 
   function renderConsumers() {
-    const states = engine?.consumers ?? { A: "idle", B: "idle" };
+    const show = Boolean(engine) && engine.runKind !== "saga";
+    consumers.hidden = !show;
+    if (!show) return;
+
+    const states = engine.consumers;
     const phase = labPhase(engine, Date.now(), labDone);
     let stateB = states.B;
-    if (engine?.runKind === "lab" && (phase === "crash" || phase === "queued" || phase === "wait-lease")) {
+    if (
+      engine.runKind === "lab" &&
+      (phase === "crash" || phase === "queued" || phase === "wait-lease")
+    ) {
       stateB = "waiting for retry";
     }
     consumerA.querySelector(".consumer-state").textContent = states.A;
@@ -1434,24 +1487,40 @@ if (typeof document !== "undefined") {
   function renderGuide() {
     const phase = labPhase(engine, Date.now(), labDone);
     narration.textContent = NARRATION[phase] ?? NARRATION.idle;
-    const currentBeat = beatForPhase(phase);
-    const inCrashLab =
-      engine?.runKind === "lab" &&
-      (engine.workflowStatus === "RUNNING" ||
-        engine.workflowStatus === "COMPLETED");
+    guide.classList.toggle("needs-you", ACTION_PHASES.has(phase));
+
+    const beatList = beatsForPhase(phase, engine);
     const showBeats =
-      (inCrashLab || (!labDone && !engine)) &&
+      Boolean(beatList) &&
       !String(phase).startsWith("free") &&
-      !String(phase).startsWith("saga") &&
-      phase !== "lab-done";
+      (phase === "idle" ||
+        phase === "lab-done" ||
+        engine?.runKind === "lab" ||
+        engine?.runKind === "saga" ||
+        String(phase).startsWith("saga"));
+
     beats.hidden = !showBeats;
-    if (!beats.hidden) {
-      const currentIdx = BEAT_ORDER.indexOf(currentBeat ?? "start");
-      for (const li of beats.querySelectorAll("[data-beat]")) {
-        const idx = BEAT_ORDER.indexOf(li.dataset.beat);
-        li.classList.toggle("current", li.dataset.beat === currentBeat);
-        li.classList.toggle("done", idx >= 0 && idx < currentIdx);
+    if (!showBeats || !beatList) return;
+
+    const kind = beatList === SAGA_BEATS ? "saga" : "crash";
+    if (beatsKind !== kind) {
+      beatsKind = kind;
+      beats.innerHTML = "";
+      for (const beat of beatList) {
+        const li = document.createElement("li");
+        li.dataset.beat = beat.id;
+        li.textContent = beat.label;
+        beats.appendChild(li);
       }
+    }
+
+    const order = beatList.map((b) => b.id);
+    const currentBeat = beatForPhase(phase);
+    const currentIdx = order.indexOf(currentBeat ?? order[0]);
+    for (const li of beats.querySelectorAll("[data-beat]")) {
+      const idx = order.indexOf(li.dataset.beat);
+      li.classList.toggle("current", li.dataset.beat === currentBeat);
+      li.classList.toggle("done", idx >= 0 && idx < currentIdx);
     }
   }
 
@@ -1502,7 +1571,12 @@ if (typeof document !== "undefined") {
   }
 
   function renderAttempts() {
-    if (!engine || engine.attempts.length === 0) {
+    if (!engine) {
+      attemptPanel.hidden = true;
+      return;
+    }
+    attemptPanel.hidden = false;
+    if (engine.attempts.length === 0) {
       attemptTable.hidden = true;
       attemptEmpty.hidden = false;
       return;
@@ -1593,17 +1667,21 @@ if (typeof document !== "undefined") {
     }
   }
 
-  function renderDag() {
-    const preset = engine?.definition ?? PRESETS[presetSelect.value];
-    dagSvg.setAttribute("viewBox", preset.viewBox);
+  function previewPreset() {
+    if (labDone) return PRESETS[presetSelect.value] ?? PRESETS.onboarding;
+    return PRESETS.onboarding;
+  }
 
-    if (!engine) {
-      dagEmpty.hidden = false;
-      dagNodes.innerHTML = "";
-      dagEdges.innerHTML = "";
-      return;
+  function renderDag() {
+    const preview = !engine;
+    const preset = engine?.definition ?? previewPreset();
+    dagSvg.setAttribute("viewBox", preset.viewBox);
+    dagEmpty.hidden = !preview;
+    if (preview) {
+      dagEmpty.innerHTML = labDone
+        ? "Pick a workflow, then <strong>Start workflow</strong>, or run a lab again."
+        : "Preview of the crash-lab graph. Press <strong>Crash lab</strong> to run it, or <strong>Saga lab</strong> for charge → fail → refund.";
     }
-    dagEmpty.hidden = true;
 
     const layout = preset.layout;
     const nodeW = 120;
@@ -1614,10 +1692,11 @@ if (typeof document !== "undefined") {
       for (const dep of taskDef.dependsOn ?? []) {
         const from = layout[dep];
         const to = layout[taskDef.id];
-        const depTask = engine.tasks.get(dep);
+        const depTask = engine?.tasks.get(dep);
         const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
         line.setAttribute("class", "dag-edge");
-        if (depTask?.status === "COMPLETED") line.classList.add("active");
+        if (preview) line.classList.add("waiting");
+        else if (depTask?.status === "COMPLETED") line.classList.add("active");
         else line.classList.add("waiting");
 
         const x1 = from.x + nodeW / 2;
@@ -1635,64 +1714,78 @@ if (typeof document !== "undefined") {
 
     dagNodes.innerHTML = "";
     for (const taskDef of preset.tasks) {
-      const task = engine.tasks.get(taskDef.id);
+      const task = engine?.tasks.get(taskDef.id);
       const pos = layout[taskDef.id];
       const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-      g.setAttribute("class", `dag-node ${task.status.toLowerCase()}`);
+      const statusName = preview ? "pending" : task.status.toLowerCase();
+      g.setAttribute(
+        "class",
+        `dag-node ${statusName}${preview ? " preview" : ""}`,
+      );
       g.setAttribute("transform", `translate(${pos.x}, ${pos.y})`);
-      g.dataset.key = task.key;
-      if (engine.canCrash(task.key)) g.classList.add("crashable");
+      if (task) g.dataset.key = task.key;
+      if (engine && engine.canCrash(task.key)) g.classList.add("crashable");
 
       const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
       rect.setAttribute("width", String(nodeW));
       rect.setAttribute("height", String(nodeH));
       rect.setAttribute("rx", "3");
-      if (task.status === "RUNNING") rect.classList.add("pulse");
+      if (!preview && task.status === "RUNNING") rect.classList.add("pulse");
 
       const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
       label.setAttribute("class", "dag-node-label");
       label.setAttribute("x", "8");
       label.setAttribute("y", "18");
-      label.textContent = task.name;
+      label.textContent = taskDef.name;
 
       const type = document.createElementNS("http://www.w3.org/2000/svg", "text");
       type.setAttribute("class", "dag-node-type");
       type.setAttribute("x", "8");
       type.setAttribute("y", "32");
-      type.textContent = task.type;
+      type.textContent = taskDef.type;
 
-      const attempt = engine.currentAttemptFor(task);
       const status = document.createElementNS("http://www.w3.org/2000/svg", "text");
       status.setAttribute("class", "dag-node-status");
       status.setAttribute("x", "8");
       status.setAttribute("y", "46");
-      if (task.status === "RUNNING" && attempt) {
-        if (engine.canCrash(task.key)) {
-          status.textContent = "click to crash";
-        } else if (engine.crashRequested.has(attempt.id)) {
-          status.textContent = `dead ${leaseLabel(attempt)}`;
-        } else {
-          const who = attempt.consumerId ? `${attempt.consumerId} ` : "";
-          status.textContent = `${who}${leaseLabel(attempt)}`;
-        }
+      if (preview) {
+        status.textContent = "idle";
       } else {
-        status.textContent = task.status;
+        const attempt = engine.currentAttemptFor(task);
+        if (task.status === "RUNNING" && attempt) {
+          if (engine.canCrash(task.key)) {
+            status.textContent = "click to crash";
+          } else if (engine.crashRequested.has(attempt.id)) {
+            status.textContent = `dead ${leaseLabel(attempt)}`;
+          } else {
+            const who = attempt.consumerId ? `${attempt.consumerId} ` : "";
+            status.textContent = `${who}${leaseLabel(attempt)}`;
+          }
+        } else {
+          status.textContent = task.status;
+        }
       }
 
       g.append(rect, label, type, status);
 
-      if (task.status === "RUNNING" && attempt) {
-        const frac = Math.max(
-          0,
-          Math.min(1, (attempt.leaseUntil - Date.now()) / engine.leaseMs),
-        );
-        const bar = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-        bar.setAttribute("class", "lease-bar");
-        bar.setAttribute("x", "1");
-        bar.setAttribute("y", String(nodeH - 4));
-        bar.setAttribute("width", String((nodeW - 2) * frac));
-        bar.setAttribute("height", "3");
-        g.append(bar);
+      if (!preview && task.status === "RUNNING") {
+        const attempt = engine.currentAttemptFor(task);
+        if (attempt) {
+          const frac = Math.max(
+            0,
+            Math.min(1, (attempt.leaseUntil - Date.now()) / engine.leaseMs),
+          );
+          const bar = document.createElementNS(
+            "http://www.w3.org/2000/svg",
+            "rect",
+          );
+          bar.setAttribute("class", "lease-bar");
+          bar.setAttribute("x", "1");
+          bar.setAttribute("y", String(nodeH - 4));
+          bar.setAttribute("width", String((nodeW - 2) * frac));
+          bar.setAttribute("height", "3");
+          g.append(bar);
+        }
       }
 
       dagNodes.appendChild(g);
@@ -1705,8 +1798,16 @@ if (typeof document !== "undefined") {
       (engine.workflowStatus === "RUNNING" ||
         engine.workflowStatus === "COMPENSATING");
     const idle = !active;
+    const kind = engine?.runKind;
 
-    presetWrap.hidden = !labDone;
+    if (
+      engine &&
+      ["COMPLETED", "FAILED", "CANCELLED"].includes(engine.workflowStatus)
+    ) {
+      labDone = true;
+    }
+
+    presetWrap.hidden = !labDone || active;
     presetSelect.disabled = active;
 
     startLabBtn.hidden = !idle;
@@ -1719,6 +1820,16 @@ if (typeof document !== "undefined") {
 
     startFreeBtn.hidden = !labDone || !idle;
     startFreeBtn.disabled = active;
+
+    const showCrash = Boolean(engine) && (kind === "lab" || kind === "free");
+    const showRecover = Boolean(engine) && (kind === "lab" || kind === "free");
+    const showFail = Boolean(engine) && (kind === "saga" || kind === "free");
+    const showCancel = Boolean(engine) && kind === "free";
+
+    crashBtn.hidden = !showCrash;
+    recoverBtn.hidden = !showRecover;
+    failBtn.hidden = !showFail;
+    cancelBtn.hidden = !showCancel;
 
     crashBtn.disabled = !engine || !engine.canCrash();
     crashBtn.classList.toggle(
@@ -1734,14 +1845,18 @@ if (typeof document !== "undefined") {
     );
 
     cancelBtn.disabled = !engine || engine.workflowStatus !== "RUNNING";
-    resetBtn.hidden = !engine;
+    resetBtn.hidden = !engine && !labDone;
+    resetBtn.textContent = engine ? "Start over" : "Reset";
 
     const dying = engine?.dyingAttempt();
     const stale = engine ? engine.staleAttempts().length > 0 : false;
     recoverBtn.disabled = !engine || !(stale || dying || engine.recoverQueued);
     recoverBtn.classList.toggle(
       "need-action",
-      stale || Boolean(engine?.recoverQueued),
+      Boolean(
+        engine &&
+          (stale || engine.recoverQueued || (dying && !engine.canCrash())),
+      ),
     );
     if (dying) {
       const ms = Math.max(0, dying.leaseUntil - Date.now());
@@ -1750,13 +1865,6 @@ if (typeof document !== "undefined") {
         : `Recover stale (${(ms / 1000).toFixed(1)}s)`;
     } else {
       recoverBtn.textContent = "Recover stale";
-    }
-
-    if (
-      engine &&
-      ["COMPLETED", "FAILED", "CANCELLED"].includes(engine.workflowStatus)
-    ) {
-      labDone = true;
     }
   }
 
@@ -1792,7 +1900,7 @@ if (typeof document !== "undefined") {
     return {
       dualClaim: true,
       runKind: "saga",
-      activityMs: 1600,
+      activityMs: 1200,
     };
   }
 
@@ -1846,6 +1954,9 @@ if (typeof document !== "undefined") {
   function resetDemo() {
     engine?.stop();
     engine = null;
+    labDone = false;
+    beatsKind = null;
+    presetSelect.value = "onboarding";
     renderAll();
   }
 

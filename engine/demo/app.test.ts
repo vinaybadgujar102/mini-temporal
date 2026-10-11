@@ -159,6 +159,21 @@ test("labPhase idle vs finished", () => {
   expect(labPhase(null, Date.now(), true)).toBe("lab-done");
 });
 
+test("labPhase stays watch after crash while retry is READY", () => {
+  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
+    dualClaim: false,
+    gateCrashKey: "verify",
+    unlockDualOnRecover: true,
+    runKind: "lab",
+  });
+  engine.start();
+  engine.labCrashUsed = true;
+  const verify = engine.tasks.get("verify");
+  verify.status = "READY";
+  verify.attemptCount = 1;
+  expect(labPhase(engine)).toBe("watch");
+});
+
 test("retryable error schedules backoff then completes", async () => {
   expect(isRetryable({ code: "503" })).toBe(true);
   expect(calculateRetryDelay(1, { ...defaultRetryPolicy, jitterFactor: 0 })).toBe(
