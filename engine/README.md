@@ -1,6 +1,6 @@
 # engine
 
-Core mini-temporal workflow engine: Postgres state, Kafka dispatch, outbox relay, leased workers, and stale-task recovery.
+Core mini-temporal workflow engine: Postgres state, Kafka dispatch, outbox relay, leased workers, retry backoff, cancel, saga compensation, and stale-task recovery.
 
 Full project documentation lives in the [root README](../README.md).
 
@@ -8,10 +8,10 @@ Full project documentation lives in the [root README](../README.md).
 
 ```bash
 bun install
-bun run demo              # crash/recover lab in the browser, no Postgres/Kafka
-bun run infra             # docker compose: Postgres + Kafka
+bun run demo              # crash / retry / saga lab in the browser, no Postgres/Kafka
+bun run infra             # docker compose: Postgres + Kafka + Prometheus + Grafana
 bun run migrate
-bun run outbox            # terminal 1
+bun run outbox            # terminal 1 (also serves /metrics on :9464)
 bun run worker            # terminal 2
 bun run start-workflow    # terminal 3
 ```
