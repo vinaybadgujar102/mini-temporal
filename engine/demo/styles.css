@@ -759,10 +759,24 @@ button:focus-visible {
 }
 
 .footnote p {
-  margin: 0;
+  margin: 0 0 0.5rem;
   max-width: 58ch;
   font-size: 0.75rem;
   color: var(--paper-dim);
+}
+
+.footnote p:last-child {
+  margin-bottom: 0;
+}
+
+.footnote a {
+  color: var(--paper);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.footnote a:hover {
+  color: var(--completed);
 }
 
 .footnote code {

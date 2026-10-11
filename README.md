@@ -1,6 +1,14 @@
 # mini-temporal
 
-Workflow orchestration in the style of [Temporal](https://temporal.io), built with Bun, PostgreSQL, and Apache Kafka.
+Durable workflow orchestration in the style of [Temporal](https://temporal.io) — Bun, PostgreSQL, Apache Kafka. Built so crashes, retries, and compensations stay correct under concurrency.
+
+**[Live demo](https://vinaybadgujar102.github.io/mini-temporal/)** — crash / retry / saga lab in the browser (no install):
+
+1. **Crash lab** → wait for Verify Email → **Crash worker** → **Recover stale** → watch the dual-consumer race (only one claim wins).
+2. **Saga lab** → confirmation fails after charge → watch `REFUND_PAYMENT`.
+3. Free play: fail / cancel / start over with order or onboarding presets.
+
+Built for: transactional outbox, leases + fencing tokens, saga compensation, idempotent charge/refund, and measured worker scaling (see [Benchmarks](#benchmarks)).
 
 You define tasks and dependencies. PostgreSQL stores workflow state, task state, an append-only event log, and saga compensation intents. Kafka carries ready tasks to workers. A transactional outbox writes scheduling intent to Postgres before anything hits the bus, so a crash after commit does not lose work.
 
@@ -77,6 +85,8 @@ The orchestrator never publishes to Kafka directly. It commits workflow state an
 If a worker dies after claim, `recoverStaleTasks` waits until `lease_until` is past, marks the attempt `TIMED_OUT`, sets the task back to `READY`, appends `TASK_RECOVERY`, and inserts a new outbox row. Stale compensation claims are requeued by `recoverStaleCompensations`.
 
 ## Demo
+
+**Live:** [vinaybadgujar102.github.io/mini-temporal](https://vinaybadgujar102.github.io/mini-temporal/)
 
 https://github.com/user-attachments/assets/9916d088-c80b-47bd-a9b0-a7363fc68a8c
 
