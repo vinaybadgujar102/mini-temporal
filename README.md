@@ -2,11 +2,7 @@
 
 Durable workflow orchestration in the style of [Temporal](https://temporal.io) — Bun, PostgreSQL, Apache Kafka. Built so crashes, retries, and compensations stay correct under concurrency.
 
-**[Live demo](https://vinaybadgujar102.github.io/mini-temporal/)** — crash / retry / saga lab in the browser (no install):
-
-1. **Crash lab** → wait for Verify Email → **Crash worker** → **Recover stale** → watch the dual-consumer race (only one claim wins).
-2. **Saga lab** → confirmation fails after charge → watch `REFUND_PAYMENT`.
-3. Free play: fail / cancel / start over with order or onboarding presets.
+**[Live demo](https://vinaybadgujar102.github.io/mini-temporal/)** — a four-chapter illustration in the browser (no install). Click through Process Order: happy path, crash and lease, fencing, then saga refund. It does not run the engine.
 
 Built for: transactional outbox, leases + fencing tokens, saga compensation, idempotent charge/refund, and measured worker scaling (see [Benchmarks](#benchmarks)).
 
@@ -88,28 +84,18 @@ If a worker dies after claim, `recoverStaleTasks` waits until `lease_until` is p
 
 **Live:** [vinaybadgujar102.github.io/mini-temporal](https://vinaybadgujar102.github.io/mini-temporal/)
 
-https://github.com/user-attachments/assets/9916d088-c80b-47bd-a9b0-a7363fc68a8c
-
-The browser demo is a crash / retry / saga lab. It does not talk to Postgres or Kafka. It runs the same claim, lease, heartbeat, recover, dual-consumer race, retry backoff, cancel, and compensation paths as the engine.
+The browser demo is an illustration of this repo's Postgres, outbox, Kafka, and workers. It does not talk to Postgres or Kafka, and it does not run the engine. Proof stays in `engine/` tests and this README. One button advances a four-chapter story. The chapter rail can jump.
 
 ```bash
 cd engine && bun run demo
 ```
 
-Open `http://localhost:3456`, then:
+Open `http://localhost:3456`, then click:
 
-**Crash lab** — click **Crash lab**:
-
-1. Wait until Verify Email is running.
-2. Click **Crash worker**. The task stays `RUNNING`. Heartbeats stop.
-3. **Recover stale** queues until the lease hits 0, then requeues the task.
-4. Two consumers race the new claim. Only one wins.
-
-**Saga lab** — click **Saga lab** to fail confirmation after charge and watch `REFUND_PAYMENT` run.
-
-**Fail task** / **Cancel** exercise retryable failure and workflow cancel on a live run.
-
-**Start over** resets the lab. Free play uses the onboarding or order preset.
+1. **Happy path.** Start, commit workflow + tasks + outbox together, dispatch once to Kafka, claim Charge and Reserve in parallel, finish both, send Email, workflow `COMPLETED`.
+2. **Crash and lease.** Worker A claims Charge and heartbeats. Crash stops heartbeats while Charge stays `RUNNING`. The lease bar shrinks on the diagram. Recover marks the attempt `TIMED_OUT`, sets the task `READY`, and writes a new outbox row. Worker B then claims with fencing token 2.
+3. **Fence.** A and B both try the recovered Charge. A wins token 2, B skips. The dead owner's complete is refused. The live owner finishes.
+4. **Saga.** Charge and Reserve complete. The same charge key would not charge twice. Email fails permanently, open work is cancelled, the workflow turns `COMPENSATING`, refund uses that same payment key, inventory has no undo, and the workflow ends `FAILED`.
 
 To crash the real worker after a successful activity, before `completeAttempt`:
 
@@ -171,10 +157,11 @@ engine/
 
     demo/
         serve.ts
-        index.html                 Crash / retry / saga lab UI
-        app.js                     In-browser engine
-        app.test.ts                Lab tests
+        index.html                 Recruiter story shell
         styles.css
+        app.js                     Diagram view
+        story.js                   Chapter beats
+        app.test.ts                Storyboard tests
 
     docker-compose.yml             Postgres 16 + Kafka + Prometheus + Grafana
     package.json
@@ -436,7 +423,7 @@ After killing a worker mid-activity, wait for the 30 second lease, then:
 bun src/recovery/recoverStaleTasks.ts
 ```
 
-Due retries need `publishDueRetries()` (used from tests / demo loop; not a packaged CLI yet). Compensation reclaim uses `recoverStaleCompensations()` and `runCompensationOnce()` the same way.
+Due retries need `publishDueRetries()` (used from tests; not a packaged CLI yet). Compensation reclaim uses `recoverStaleCompensations()` and `runCompensationOnce()` the same way.
 
 ### 9. Start a workflow
 
@@ -452,7 +439,7 @@ Runs the bundled order-processing example and prints `workflowId`. Charge and re
 bun run demo
 ```
 
-Open `http://localhost:3456`.
+Open `http://localhost:3456`. The page is a click-through illustration, not a live engine. See [Demo](#demo).
 
 ## Testing
 
@@ -460,7 +447,7 @@ Open `http://localhost:3456`.
 cd engine && bun test
 ```
 
-`demo/app.test.ts` covers the crash lab, retry backoff, cancel, and saga refund.
+`demo/app.test.ts` checks the storyboard: one dispatch hop, lease recovery, fencing token 2, and the saga refund key.
 
 Integration tests under `src/workflow/` exercise completion, failure propagation, cancel, and compensation against Postgres when `DATABASE_URL` is set:
 
@@ -576,7 +563,7 @@ These numbers are a laptop baseline, not a production SLA. Re-run after hardware
 - Relay publishes one row at a time, no `FOR UPDATE SKIP LOCKED`.
 - Kafka offsets use KafkaJS defaults, not production settings.
 - OpenTelemetry is not wired; metrics cover the outbox path only.
-- Browser demo is separate from Postgres and Kafka.
+- Browser demo is an illustration. It does not run the engine and does not talk to Postgres or Kafka.
 - Task recovery is a one-shot script, not a loop.
 
 ## Planned work

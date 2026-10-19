@@ -8,7 +8,7 @@ Full project documentation lives in the [root README](../README.md).
 
 ```bash
 bun install
-bun run demo              # crash / retry / saga lab in the browser, no Postgres/Kafka
+bun run demo              # illustrated Process Order story, no Postgres/Kafka
 bun run infra             # docker compose: Postgres + Kafka + Prometheus + Grafana
 bun run migrate
 bun run outbox            # terminal 1 (also serves /metrics on :9464)

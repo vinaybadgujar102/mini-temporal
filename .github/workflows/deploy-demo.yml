@@ -29,7 +29,7 @@ jobs:
       - name: Stage static demo
         run: |
           mkdir -p _site
-          cp engine/demo/index.html engine/demo/styles.css engine/demo/app.js _site/
+          cp engine/demo/index.html engine/demo/styles.css engine/demo/app.js engine/demo/story.js _site/
           touch _site/.nojekyll
 
       - uses: actions/configure-pages@v5

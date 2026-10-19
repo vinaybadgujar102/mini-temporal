@@ -1,290 +1,127 @@
 import { expect, test } from "bun:test";
 import {
-  MiniTemporalEngine,
-  PRESETS,
-  eventSentence,
-  labPhase,
-  isRetryable,
-  calculateRetryDelay,
-  defaultRetryPolicy,
-} from "./app.js";
+  advance,
+  beatAt,
+  CHAPTERS,
+  DISCLAIMER,
+  GITHUB,
+  initial,
+  jump,
+  keptNodes,
+  NODES,
+  PAYMENT_KEY,
+  present,
+} from "./story.js";
 
-test("dual claim: loser skips, winner completes", async () => {
-  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
-    activityMs: 120,
-    outboxMs: 10,
-    leaseMs: 2000,
-    heartbeatMs: 80,
-  });
-  engine.start();
-  await engine.run();
-
-  expect(engine.workflowStatus).toBe("COMPLETED");
-  expect(engine.events.filter((e) => e.eventType === "CLAIM_WON")).toHaveLength(
-    3,
-  );
-  expect(
-    engine.events.filter((e) => e.eventType === "CLAIM_SKIPPED"),
-  ).toHaveLength(3);
-  expect(engine.attempts).toHaveLength(3);
+test("four chapters and every beat names a real node", () => {
+  expect(CHAPTERS.map((chapter) => chapter.id)).toEqual(["happy", "crash", "fence", "saga"]);
+  for (const chapter of CHAPTERS) {
+    expect(chapter.beats.length).toBeGreaterThan(1);
+    for (const beat of chapter.beats) {
+      expect(NODES).toContain(beat.focus);
+      expect(beat.caption.endsWith(".")).toBe(true);
+      expect(beat.caption.split(".").filter(Boolean)).toHaveLength(1);
+      expect(beat.cta.length).toBeGreaterThan(0);
+      for (const id of beat.hot) expect(NODES).toContain(id);
+    }
+  }
 });
 
-test("manual crash then recover: retry races A and B", async () => {
-  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
-    activityMs: 500,
-    outboxMs: 10,
-    leaseMs: 350,
-    heartbeatMs: 80,
-  });
-
-  let crashed = false;
-  let recovered = false;
-  engine.start();
-  await engine.run(() => {
-    if (!crashed && engine.tasks.get("verify")?.status === "RUNNING") {
-      engine.crashWorker("verify");
-      crashed = true;
-    }
-    if (crashed && !recovered && engine.staleAttempts().length > 0) {
-      engine.recover();
-      recovered = true;
-    }
-  });
-
-  expect(crashed).toBe(true);
-  expect(recovered).toBe(true);
-  const types = engine.events.map((e) => e.eventType);
-  expect(types).toContain("WORKER_CRASHED");
-  expect(types).toContain("TASK_RECOVERY");
-  expect(types).toContain("CLAIM_SKIPPED");
-  expect(engine.workflowStatus).toBe("COMPLETED");
-
-  const verifyAttempts = engine.attempts.filter((a) => a.taskKey === "verify");
-  expect(verifyAttempts).toHaveLength(2);
-  expect(verifyAttempts[0].status).toBe("TIMED_OUT");
-  expect(verifyAttempts[1].status).toBe("COMPLETED");
-}, 15_000);
-
-test("lab: verify waits for crash, first claim is A only, recover races A and B", async () => {
-  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
-    activityMs: 80,
-    outboxMs: 10,
-    leaseMs: 280,
-    heartbeatMs: 60,
-    dualClaim: false,
-    gateCrashKey: "verify",
-    unlockDualOnRecover: true,
-    runKind: "lab",
-  });
-
-  engine.start();
-  const done = engine.run();
-
-  const wait = async (pred, ms = 8000) => {
-    const start = Date.now();
-    while (!pred()) {
-      if (Date.now() - start > ms) throw new Error("timeout");
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  };
-
-  await wait(() => engine.tasks.get("verify")?.status === "RUNNING");
-  await new Promise((r) => setTimeout(r, 200));
-  expect(engine.tasks.get("verify")?.status).toBe("RUNNING");
-  expect(engine.tasks.get("verify")?.attemptCount).toBe(1);
-  expect(
-    engine.events.filter((e) => e.eventType === "CLAIM_SKIPPED"),
-  ).toHaveLength(0);
-
-  engine.crashWorker("verify");
-  expect(engine.labCrashUsed).toBe(true);
-  expect(engine.crashWorker("verify")).toBe(false);
-
-  await wait(() => engine.staleAttempts().length > 0);
-  expect(labPhase(engine)).toBe("recover");
-  engine.recover();
-  expect(engine.dualClaim).toBe(true);
-
-  await done;
-  expect(engine.workflowStatus).toBe("COMPLETED");
-  expect(labPhase(engine)).toBe("lab-done");
-
-  const verifyAttempts = engine.attempts.filter((a) => a.taskKey === "verify");
-  expect(verifyAttempts).toHaveLength(2);
-  expect(
-    engine.events.filter((e) => e.eventType === "CLAIM_SKIPPED").length,
-  ).toBeGreaterThan(0);
-}, 15_000);
-
-test("queue recover before lease dies, run() recovers", async () => {
-  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
-    activityMs: 80,
-    outboxMs: 10,
-    leaseMs: 250,
-    heartbeatMs: 60,
-    dualClaim: false,
-    gateCrashKey: "verify",
-    unlockDualOnRecover: true,
-    runKind: "lab",
-  });
-
-  engine.start();
-  const done = engine.run();
-  const wait = async (pred, ms = 8000) => {
-    const start = Date.now();
-    while (!pred()) {
-      if (Date.now() - start > ms) throw new Error("timeout");
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  };
-
-  await wait(() => engine.tasks.get("verify")?.status === "RUNNING");
-  engine.crashWorker("verify");
-  expect(engine.queueRecover()).toBe("queued");
-  await done;
-  expect(engine.workflowStatus).toBe("COMPLETED");
-}, 15_000);
-
-test("eventSentence names the crash", () => {
-  expect(
-    eventSentence({
-      eventType: "WORKER_CRASHED",
-      data: { taskKey: "verify", consumerId: "A" },
-    }),
-  ).toBe("Worker A crashed on Verify Email. Lease still live.");
+test("happy path dispatch is one hop, including the email send", () => {
+  const beats = CHAPTERS[0].beats;
+  expect(beats.map((beat) => beat.id)).toEqual([
+    "start",
+    "commit",
+    "dispatch",
+    "claim",
+    "both-done",
+    "email",
+  ]);
+  expect(beats.find((beat) => beat.id === "both-done")?.tasks.email).toBe("READY");
+  const kafkaBeats = beats.filter((beat) => beat.hot.includes("kafka"));
+  expect(kafkaBeats.map((beat) => beat.id)).toEqual(["dispatch", "email"]);
+  for (const beat of kafkaBeats) expect(beat.hot).toContain("outbox");
+  expect(beats.find((beat) => beat.id === "claim")?.tokens).toEqual({ A: 1, B: 1 });
+  expect(beats.at(-1)?.workflow).toBe("COMPLETED");
+  expect(beats.at(-1)?.cta).toBe("Next chapter");
 });
 
-test("labPhase idle vs finished", () => {
-  expect(labPhase(null)).toBe("idle");
-  expect(labPhase(null, Date.now(), true)).toBe("lab-done");
+test("crash recovers only after the lease shrinks, then B claims token 2", () => {
+  const beats = CHAPTERS[1].beats;
+  const claim = beats.find((beat) => beat.id === "claim");
+  const crash = beats.find((beat) => beat.id === "crash");
+  const recover = beats.find((beat) => beat.id === "recover");
+  const reclaim = beats.find((beat) => beat.id === "reclaim");
+  expect(claim?.lease).toBe("live");
+  expect(claim?.tasks.charge).toBe("RUNNING");
+  expect(crash?.lease).toBe("shrink");
+  expect(crash?.tasks.charge).toBe("RUNNING");
+  expect(crash?.cta).toBe("Recover");
+  expect(recover?.attempt).toBe("TIMED_OUT");
+  expect(recover?.tasks.charge).toBe("READY");
+  expect(recover?.hot).toContain("outbox");
+  expect(recover?.hot).not.toContain("kafka");
+  expect(reclaim?.hot).toEqual(expect.arrayContaining(["outbox", "kafka"]));
+  expect(reclaim?.tokens.B).toBe(2);
 });
 
-test("labPhase stays watch after crash while retry is READY", () => {
-  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
-    dualClaim: false,
-    gateCrashKey: "verify",
-    unlockDualOnRecover: true,
-    runKind: "lab",
-  });
-  engine.start();
-  engine.labCrashUsed = true;
-  const verify = engine.tasks.get("verify");
-  verify.status = "READY";
-  verify.attemptCount = 1;
-  expect(labPhase(engine)).toBe("watch");
+test("fence: A wins token 2, B skips, stale complete is a separate beat", () => {
+  const beats = CHAPTERS[2].beats;
+  expect(beats.map((beat) => beat.id)).toEqual(["ready", "race", "stale", "finish"]);
+  expect(beats[1].tokens).toEqual({ A: 2, B: "skip" });
+  expect(beats[2].stale).toBe("A");
+  expect(beats[2].tasks.charge).toBe("RUNNING");
+  expect(beats[3].tasks.charge).toBe("COMPLETED");
+  expect(beats[3].tokens.A).toBe(2);
 });
 
-test("retryable error schedules backoff then completes", async () => {
-  expect(isRetryable({ code: "503" })).toBe(true);
-  expect(calculateRetryDelay(1, { ...defaultRetryPolicy, jitterFactor: 0 })).toBe(
-    400,
-  );
+test("saga refunds the same charge key and ends FAILED", () => {
+  const beats = CHAPTERS[3].beats;
+  const both = beats.find((beat) => beat.id === "both-done");
+  const refund = beats.find((beat) => beat.id === "refund");
+  const failed = beats.at(-1);
+  expect(both?.paymentKey).toBe(PAYMENT_KEY);
+  expect(both?.caption).toContain("would not charge twice");
+  expect(refund?.sameKey).toBe(true);
+  expect(refund?.paymentKey).toBe(both?.paymentKey);
+  expect(refund?.caption).toContain("inventory has no undo");
+  expect(beats.find((beat) => beat.id === "email-fail")?.workflow).toBe("COMPENSATING");
+  expect(beats.find((beat) => beat.id === "cancel")).toBeUndefined();
+  expect(failed?.workflow).toBe("FAILED");
+  expect(failed?.href).toBe(GITHUB);
+  expect(failed?.cta).not.toBe("Next chapter");
+});
 
-  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
-    activityMs: 80,
-    outboxMs: 10,
-    leaseMs: 2000,
-    heartbeatMs: 60,
-    dualClaim: false,
-    runKind: "free",
-    retryPolicy: { ...defaultRetryPolicy, maxAttempts: 3, initialDelayMs: 50 },
-  });
+test("rail jump clears lease and peach from the previous chapter", () => {
+  const crashIndex = CHAPTERS[1].beats.findIndex((beat) => beat.id === "crash");
+  const mid = { chapter: 1, beat: crashIndex };
+  expect(beatAt(mid).lease).toBe("shrink");
+  expect(beatAt(mid).focus).toBe("workerA");
+  const jumped = jump(2);
+  expect(jumped).toEqual({ chapter: 2, beat: 0 });
+  expect(beatAt(jumped).lease).toBeNull();
+  expect(present(jumped).dim).not.toContain(beatAt(jumped).focus);
+  expect(present(mid).dim).toContain("workerB");
+});
 
-  engine.start();
-  const done = engine.run(() => {
-    const verify = engine.tasks.get("verify");
-    const attempt = engine.attempts.find(
-      (a) => a.taskKey === "verify" && a.status === "RUNNING",
-    );
-    if (
-      verify?.status === "RUNNING" &&
-      attempt &&
-      verify.attemptCount === 1 &&
-      !engine.failRequested.has(attempt.id)
-    ) {
-      engine.failWorker("verify", { code: "503", message: "upstream busy" });
-    }
-  });
+test("next chapter advances, and the last chapter stays put", () => {
+  let state = { chapter: 0, beat: CHAPTERS[0].beats.length - 1 };
+  expect(beatAt(state).terminal).toBe(true);
+  state = advance(state);
+  expect(state).toEqual(initial(1));
+  const end = { chapter: 3, beat: CHAPTERS[3].beats.length - 1 };
+  expect(advance(end)).toBe(end);
+});
 
-  await done;
-  expect(engine.workflowStatus).toBe("COMPLETED");
-  expect(
-    engine.events.some((e) => e.eventType === "TASK_RETRY_SCHEDULED"),
-  ).toBe(true);
-  const verifyAttempts = engine.attempts.filter((a) => a.taskKey === "verify");
-  expect(verifyAttempts.length).toBeGreaterThanOrEqual(2);
-  expect(verifyAttempts[0].status).toBe("FAILED");
-}, 15_000);
-
-test("cancel stops open tasks", async () => {
-  const engine = new MiniTemporalEngine(PRESETS.onboarding, {
-    activityMs: 800,
-    outboxMs: 10,
-    leaseMs: 2000,
-    heartbeatMs: 60,
-    dualClaim: false,
-    gateCrashKey: "verify",
-    runKind: "free",
-  });
-
-  engine.start();
-  const done = engine.run();
-  const wait = async (pred, ms = 8000) => {
-    const start = Date.now();
-    while (!pred()) {
-      if (Date.now() - start > ms) throw new Error("timeout");
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  };
-
-  await wait(() => engine.tasks.get("verify")?.status === "RUNNING");
-  expect(engine.cancelWorkflow().outcome).toBe("CANCELLED");
-  await done;
-
-  expect(engine.workflowStatus).toBe("CANCELLED");
-  expect(engine.tasks.get("verify")?.status).toBe("CANCELLED");
-  expect(engine.tasks.get("profile")?.status).toBe("CANCELLED");
-  expect(engine.events.map((e) => e.eventType)).toContain("WORKFLOW_CANCELLED");
-}, 15_000);
-
-test("saga: permanent fail after charge refunds payment", async () => {
-  const engine = new MiniTemporalEngine(PRESETS.checkout, {
-    activityMs: 60,
-    outboxMs: 10,
-    leaseMs: 2000,
-    heartbeatMs: 50,
-    dualClaim: true,
-    runKind: "saga",
-  });
-
-  engine.start();
-  await engine.run(() => {
-    if (
-      engine.workflowStatus === "RUNNING" &&
-      engine.tasks.get("email")?.status === "RUNNING"
-    ) {
-      engine.failWorker("email", {
-        code: "FATAL",
-        message: "confirmation rejected",
-      });
-    }
-  });
-
-  expect(engine.workflowStatus).toBe("FAILED");
-  expect(engine.tasks.get("charge")?.status).toBe("COMPLETED");
-  expect(engine.tasks.get("email")?.status).toBe("FAILED");
-  expect(engine.compensations).toHaveLength(1);
-  expect(engine.compensations[0].status).toBe("COMPLETED");
-  expect(engine.compensations[0].compensationType).toBe("REFUND_PAYMENT");
-
-  const stored = engine.paymentStore.get(
-    engine.tasks.get("charge").operationId,
-  );
-  expect(stored?.status).toBe("REFUNDED");
-  expect(engine.events.map((e) => e.eventType)).toContain(
-    "WORKFLOW_COMPENSATION_STARTED",
-  );
-  expect(engine.events.map((e) => e.eventType)).toContain(
-    "COMPENSATION_COMPLETED",
-  );
-}, 15_000);
+test("copy does not claim a live in-browser engine", async () => {
+  const html = await Bun.file(new URL("./index.html", import.meta.url)).text();
+  const app = await Bun.file(new URL("./app.js", import.meta.url)).text();
+  const css = await Bun.file(new URL("./styles.css", import.meta.url)).text();
+  const blob = `${JSON.stringify(CHAPTERS)} ${DISCLAIMER} ${html} ${app}`;
+  expect(blob.toLowerCase()).not.toContain("same concurrency model");
+  expect(blob.toLowerCase()).not.toContain("live engine");
+  expect(blob).not.toContain("MiniTemporalEngine");
+  expect(css).not.toContain("transition: all");
+  expect(css).not.toMatch(/scale\(0\)/);
+  expect(keptNodes(CHAPTERS[0].beats[2]).has("outbox")).toBe(true);
+});
